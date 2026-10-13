@@ -1,3 +1,10 @@
+> **AntPitPhoto** — this repository is AntPitLab's fork of [LightCraft](https://github.com/storytold/lightcraft),
+> tuned for fine-art exhibition prints: Italian interface, print size in centimetres, printed paper
+> border, «Mostra» export presets, its own name and icon. What changes and how to build it:
+> [docs/antpitphoto.md](docs/antpitphoto.md). Same licences as LightCraft (MIT OR Apache-2.0); not
+> affiliated with or endorsed by the LightCraft or ArtCraft authors. The rest of this page is
+> LightCraft's own README.
+
 <p align="center">
   <a href="https://getartcraft.com/">
     <picture>

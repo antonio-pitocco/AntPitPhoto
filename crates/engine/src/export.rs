@@ -169,7 +169,83 @@ pub fn builtin_presets() -> Vec<ExportPreset> {
         p("JPEG (Large)", serde_json::json!({"format": "jpeg", "quality": 92, "longEdge": 0, "colorSpace": "srgb"})),
         p("Original + Settings", serde_json::json!({"format": "original"})),
         p("DNG", serde_json::json!({"format": "dng"})),
+        // AntPitLab: exhibition prints and their web versions (docs/antpitlab-mostra.md)
+        p(
+            "Mostra: stampa laboratorio (TIFF 16 bit Adobe RGB, 300 ppi, carta opaca)",
+            serde_json::json!({"format": "tiff", "bitDepth": 16, "colorSpace": "adobeRgb", "ppi": 300, "percent": 100,
+                "sharpen": "matte", "sharpenAmount": "standard", "tiffCompression": "zip", "metadata": "copyright", "removeLocation": true}),
+        ),
+        p(
+            "Mostra: stampa laboratorio (TIFF 16 bit Adobe RGB, 300 ppi, carta baritata)",
+            serde_json::json!({"format": "tiff", "bitDepth": 16, "colorSpace": "adobeRgb", "ppi": 300, "percent": 100,
+                "sharpen": "glossy", "sharpenAmount": "standard", "tiffCompression": "zip", "metadata": "copyright", "removeLocation": true}),
+        ),
+        p(
+            "Mostra: stampa 40×60 cm con bordo carta 5 cm (TIFF 16 bit Adobe RGB, 300 ppi)",
+            serde_json::json!({"format": "tiff", "bitDepth": 16, "colorSpace": "adobeRgb", "ppi": 300, "printCm": [60, 40],
+                "border": {"cm": 5, "bottomCm": 6}, "sharpen": "matte", "sharpenAmount": "standard", "tiffCompression": "zip",
+                "metadata": "copyright", "removeLocation": true}),
+        ),
+        p(
+            "Mostra: web galleria (JPEG sRGB 2560 px)",
+            serde_json::json!({"format": "jpeg", "quality": 85, "longEdge": 2560, "colorSpace": "srgb", "ppi": 72,
+                "sharpen": "screen", "sharpenAmount": "standard", "metadata": "copyright", "removeLocation": true}),
+        ),
     ]
+}
+
+/// A plain paper margin around the exported picture, in centimetres at the export's `ppi` (AntPitLab:
+/// prints for an exhibition, a printed border or the paper a mat covers). `bottom_cm`, when given,
+/// replaces `cm` at the bottom (a heavier bottom margin, as mats are cut).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Border {
+    pub cm: f32,
+    pub bottom_cm: Option<f32>,
+    /// Paper tone, display-encoded 0..=255 in the output space (255 = paper white). Neutral in
+    /// every output space, so it stays neutral after the conversion.
+    pub gray: u8,
+}
+
+impl Default for Border {
+    fn default() -> Self {
+        Self { cm: 0.0, bottom_cm: None, gray: 255 }
+    }
+}
+
+/// Largest margin accepted, in centimetres.
+pub const BORDER_MAX_CM: f64 = 50.0;
+
+impl Border {
+    /// `(sides and top, bottom)` in pixels at `ppi`.
+    pub fn pixels(&self, ppi: u16) -> (usize, usize) {
+        let px = |cm: f32| (cm.clamp(0.0, BORDER_MAX_CM as f32) as f64 / 2.54 * ppi.max(1) as f64).round() as usize;
+        (px(self.cm), px(self.bottom_cm.unwrap_or(self.cm)))
+    }
+
+    /// `img` placed on a sheet with this margin (sides and top `m`, bottom `b` pixels).
+    pub fn pad<T: Copy>(&self, w: usize, h: usize, data: &[T], fill: T, m: usize, b: usize) -> (usize, usize, Vec<T>) {
+        let (ow, oh) = (w + 2 * m, h + m + b);
+        let mut out = vec![fill; ow * oh];
+        for y in 0..h {
+            let (src, dst) = (y * w, (y + m) * ow + m);
+            if let (Some(s), Some(d)) = (data.get(src..src + w), out.get_mut(dst..dst + w)) {
+                d.copy_from_slice(s);
+            }
+        }
+        (ow, oh, out)
+    }
+}
+
+/// [`Border`] from `app.export`'s `border` param: a number (cm on every side) or
+/// `{cm, bottomCm?, gray?}`.
+fn border_from_json(v: &serde_json::Value) -> Option<Border> {
+    let b = match v {
+        serde_json::Value::Number(n) => Border { cm: n.as_f64()? as f32, ..Default::default() },
+        serde_json::Value::Object(_) => serde_json::from_value(v.clone()).ok()?,
+        _ => return None,
+    };
+    (b.cm > 0.0 || b.bottom_cm.is_some_and(|c| c > 0.0)).then_some(b)
 }
 
 /// Output sharpening target (applied after resizing, in display-encoded values).
@@ -712,6 +788,8 @@ pub struct ExportOptions {
     pub photos_album: String,
     /// The curve of an HDR AVIF: PQ (default) or HLG.
     pub hdr_transfer: HdrCurve,
+    /// Paper margin around the picture (AntPitLab, exhibition prints); `None` = none.
+    pub border: Option<Border>,
 }
 
 impl Default for ExportOptions {
@@ -742,6 +820,7 @@ impl Default for ExportOptions {
             add_to_photos: false,
             photos_album: String::new(),
             hdr_transfer: HdrCurve::Pq,
+            border: None,
         }
     }
 }
@@ -784,6 +863,8 @@ pub const OPTION_PARAMS: &[&str] = &[
     "addToPhotos",
     "photosAlbum",
     "hdrTransfer",
+    "printCm",
+    "border",
 ];
 
 /// Why an export can't add its files to Apple Photos on this platform (`None`: it can, when the
@@ -971,6 +1052,35 @@ impl ExportOptions {
                     }
                 }
                 "watermark" => Self::validate_watermark(cmd, v)?,
+                "printCm" => {
+                    let sizes: Vec<&Value> = match v {
+                        Value::Array(a) if a.len() == 2 => a.iter().collect(),
+                        Value::Array(_) => return Err(bad(format!("`{k}` must be a long edge in cm or [width, height] in cm"))),
+                        _ => vec![v],
+                    };
+                    for s in sizes {
+                        num(k, s, 0.5, 1000.0)?;
+                    }
+                }
+                "border" => match v {
+                    Value::Number(_) => {
+                        num(k, v, 0.0, BORDER_MAX_CM)?;
+                    }
+                    Value::Object(o) => {
+                        if let Some(x) = o.keys().find(|x| !matches!(x.as_str(), "cm" | "bottomCm" | "gray")) {
+                            return Err(bad(unknown_key("border key", x, &["cm", "bottomCm", "gray"])));
+                        }
+                        for key in ["cm", "bottomCm"] {
+                            if let Some(c) = o.get(key).filter(|c| !c.is_null()) {
+                                num(key, c, 0.0, BORDER_MAX_CM)?;
+                            }
+                        }
+                        if let Some(g) = o.get("gray") {
+                            int("gray", g, 0, 255)?;
+                        }
+                    }
+                    _ => return Err(bad(format!("`{k}` must be centimetres or {{cm, bottomCm?, gray?}}"))),
+                },
                 "id" => {
                     int(k, v, 0, i64::MAX)?;
                 }
@@ -1096,6 +1206,7 @@ impl ExportOptions {
             add_to_photos: p.get("addToPhotos").and_then(Value::as_bool).unwrap_or(d.add_to_photos),
             photos_album: s("photosAlbum").map_or(d.photos_album, |a| a.trim().to_string()),
             hdr_transfer: s("hdrTransfer").and_then(HdrCurve::parse).unwrap_or(d.hdr_transfer),
+            border: p.get("border").and_then(border_from_json),
         }
     }
 
@@ -1103,6 +1214,18 @@ impl ExportOptions {
         use serde_json::Value;
         let f = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| *v > 0.0);
         let dont_enlarge = p.get("dontEnlarge").and_then(Value::as_bool).unwrap_or(true);
+        // AntPitLab: a print size in centimetres at `ppi` (an exact size: enlarging is allowed)
+        if let Some(v) = p.get("printCm") {
+            let ppi = p.get("ppi").and_then(Value::as_u64).filter(|v| *v > 0).unwrap_or(Self::default().ppi as u64) as f64;
+            let px = |cm: &Value| cm.as_f64().filter(|c| c.is_finite() && *c > 0.0).map(|c| (c / 2.54 * ppi).round().min(65_535.0));
+            return match v {
+                Value::Array(a) => {
+                    let (w, h) = (px(a.first()?)?, px(a.get(1)?)?);
+                    Some(Resize { mode: ResizeMode::Dimensions, value: w as f32, height: h as u32, dont_enlarge: false })
+                }
+                _ => Some(Resize { mode: ResizeMode::LongEdge, value: px(v)? as f32, height: 0, dont_enlarge: false }),
+            };
+        }
         if let Some(r) = p.get("resize").filter(|v| v.is_object()) {
             let r: Resize = serde_json::from_value(r.clone()).ok()?;
             return (r.value > 0.0).then_some(Resize { dont_enlarge: p.get("dontEnlarge").and_then(Value::as_bool).unwrap_or(r.dont_enlarge), ..r });
@@ -1146,7 +1269,7 @@ impl ExportOptions {
 
     /// Whether `p` names an output size (any of the size params, even 0 = full size).
     pub fn has_size_param(p: &serde_json::Value) -> bool {
-        ["resize", "longEdge", "shortEdge", "width", "height", "megapixels", "percent"].iter().any(|k| p.get(k).is_some())
+        ["resize", "longEdge", "shortEdge", "width", "height", "megapixels", "percent", "printCm"].iter().any(|k| p.get(k).is_some())
     }
 
     /// The size params of [`ExportOptions::from_json`] for `resize` (`{}` = full size).
@@ -1393,6 +1516,11 @@ fn finish_8bit(img: &Rgba8, o: &ExportOptions) -> Rgba8 {
         let wm = Watermark { color: srgb8_in(space, wm.color), target: Some(space), ..wm.clone() };
         draw_watermark(&mut img, &wm);
     }
+    if let Some(b) = &o.border {
+        let (m, bottom) = b.pixels(o.ppi);
+        let (w, h, data) = b.pad(img.width, img.height, &img.data, [b.gray, b.gray, b.gray, 255], m, bottom);
+        img = Rgba8 { width: w, height: h, data };
+    }
     img
 }
 
@@ -1404,7 +1532,32 @@ fn finish_deep(img: &DeepImage, o: &ExportOptions) -> DeepImage {
         let wm = Watermark { color: srgb8_in(img.space, wm.color), target: Some(img.space), ..wm.clone() };
         draw_watermark_deep(&mut img, &wm);
     }
+    if let Some(b) = &o.border {
+        let (m, bottom) = b.pixels(o.ppi);
+        img = pad_deep(&img, b, m, bottom);
+    }
     img
+}
+
+/// [`Border::pad`] for a high-bit-depth image: three samples per pixel, display-encoded (16-bit)
+/// or linear (float).
+fn pad_deep(img: &DeepImage, b: &Border, m: usize, bottom: usize) -> DeepImage {
+    let g = b.gray as f32 / 255.0;
+    let (width, height, samples) = match &img.samples {
+        DeepSamples::U16(v) => {
+            let px: Vec<[u16; 3]> = v.as_chunks::<3>().0.to_vec();
+            let fill = [(g * 65535.0).round() as u16; 3];
+            let (w, h, out) = b.pad(img.width, img.height, &px, fill, m, bottom);
+            (w, h, DeepSamples::U16(out.into_iter().flatten().collect()))
+        }
+        DeepSamples::F32(v) => {
+            let px: Vec<[f32; 3]> = v.as_chunks::<3>().0.to_vec();
+            let fill = [img.space.trc().decode(g); 3];
+            let (w, h, out) = b.pad(img.width, img.height, &px, fill, m, bottom);
+            (w, h, DeepSamples::F32(out.into_iter().flatten().collect()))
+        }
+    };
+    DeepImage { width, height, space: img.space, samples }
 }
 
 /// Encode an ISO 21496-1 gain map JPEG from the SDR rendition `sdr` (8-bit, in the output space)
@@ -3279,5 +3432,72 @@ mod tests {
         assert_eq!(render_weight(1000 * 500, 1000, SourceLevel::Preview, 0), 1000 * 500 * 12);
         assert_eq!(render_weight(0, 0, SourceLevel::Full, 0), 0);
         assert!(render_weight(usize::MAX, 1, SourceLevel::Full, usize::MAX) > 0, "no overflow");
+    }
+}
+
+/// AntPitLab: print sizes in centimetres and the paper border.
+#[cfg(test)]
+mod antpitlab_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn print_cm_is_pixels_at_ppi_and_may_enlarge() {
+        let o = ExportOptions::from_params(&json!({"printCm": 30, "ppi": 300})).unwrap();
+        let r = o.resize.unwrap();
+        assert_eq!((r.mode, r.value as u32, r.dont_enlarge), (ResizeMode::LongEdge, 3543, false));
+        // 60 × 40 cm at 300 ppi fits a 3:2 photo either way round and enlarges a 60 MP file
+        let o = ExportOptions::from_params(&json!({"printCm": [60, 40], "ppi": 300})).unwrap();
+        assert_eq!(o.resize.unwrap().apply(9520.0, 6336.0), (7087, 4717));
+        assert_eq!(o.resize.unwrap().apply(6336.0, 9520.0), (4717, 7087));
+        // ppi defaults to the export default (240)
+        let o = ExportOptions::from_params(&json!({"printCm": 25.4})).unwrap();
+        assert_eq!(o.resize.unwrap().value as u32, 2400);
+        assert!(ExportOptions::has_size_param(&json!({"printCm": 30})));
+    }
+
+    #[test]
+    fn print_cm_and_border_are_validated() {
+        assert!(ExportOptions::from_params(&json!({"printCm": [60]})).is_err());
+        assert!(ExportOptions::from_params(&json!({"printCm": 0})).is_err());
+        assert!(ExportOptions::from_params(&json!({"border": "wide"})).is_err());
+        assert!(ExportOptions::from_params(&json!({"border": {"cm": 5, "top": 1}})).is_err());
+        assert!(ExportOptions::from_params(&json!({"border": {"cm": 500}})).is_err());
+        assert!(ExportOptions::from_params(&json!({"border": {"cm": 5, "gray": 300}})).is_err());
+        let o = ExportOptions::from_params(&json!({"border": {"cm": 5, "bottomCm": 6, "gray": 250}})).unwrap();
+        assert_eq!(o.border, Some(Border { cm: 5.0, bottom_cm: Some(6.0), gray: 250 }));
+        assert_eq!(ExportOptions::from_params(&json!({"border": 0})).unwrap().border, None);
+        assert_eq!(ExportOptions::from_params(&json!({"border": 2})).unwrap().border.unwrap().cm, 2.0);
+    }
+
+    #[test]
+    fn border_pads_8_bit_and_deep_renders() {
+        let o = ExportOptions::from_params(&json!({"border": {"cm": 2.54, "bottomCm": 5.08}, "ppi": 10})).unwrap();
+        assert_eq!(o.border.unwrap().pixels(10), (10, 20));
+        let img = Rgba8::filled(4, 3, [10, 20, 30, 255]);
+        let out = finish_8bit(&img, &o);
+        assert_eq!((out.width, out.height), (24, 33));
+        assert_eq!(out.get(0, 0), [255, 255, 255, 255]);
+        assert_eq!(out.get(10, 10), [10, 20, 30, 255]);
+        assert_eq!(out.get(13, 12), [10, 20, 30, 255]);
+        assert_eq!(out.get(14, 12), [255, 255, 255, 255]);
+        assert_eq!(out.get(10, 13), [255, 255, 255, 255]);
+        let deep = DeepImage { width: 4, height: 3, space: OutputSpace::AdobeRgb, samples: DeepSamples::U16(vec![1000; 36]) };
+        let d = finish_deep(&deep, &o);
+        assert_eq!((d.width, d.height), (24, 33));
+        let DeepSamples::U16(v) = &d.samples else { panic!("16-bit stays 16-bit") };
+        assert_eq!(v.len(), 24 * 33 * 3);
+        assert_eq!(&v[0..3], &[65535; 3]);
+        assert_eq!(&v[(10 * 24 + 10) * 3..(10 * 24 + 10) * 3 + 3], &[1000; 3]);
+        let lin = DeepImage { width: 1, height: 1, space: OutputSpace::Srgb, samples: DeepSamples::F32(vec![0.5; 3]) };
+        let DeepSamples::F32(v) = finish_deep(&lin, &o).samples else { panic!("float stays float") };
+        assert!((v[0] - 1.0).abs() < 1e-6, "paper white is linear 1.0");
+    }
+
+    #[test]
+    fn exhibition_presets_are_valid_exports() {
+        for p in builtin_presets().iter().filter(|p| p.name.starts_with("Mostra")) {
+            ExportOptions::from_params(&p.params).unwrap_or_else(|e| panic!("{}: {e}", p.name));
+        }
     }
 }

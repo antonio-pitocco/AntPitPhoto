@@ -63,7 +63,13 @@ impl Headless {
         use lightcraft_engine::export::{Destination, ExportFormat, ExportOptions, Resize, prepare_batch, run_batch};
         let p = &self.session.export_params(p)?;
         let mut opts = ExportOptions::from_params(p).map_err(|e| e.to_string())?;
-        if !ExportOptions::has_size_param(p) {
+        // A quick 3000 px picture when no size is named, except for print masters (AntPitLab): a
+        // 16-bit TIFF / PSD or a file with a print resolution is meant at full size, and a silent
+        // 3000 px would print a third as large as its ppi promises.
+        let print_master = matches!(opts.effective_depth(), lightcraft_engine::pipeline::OutputDepth::U16 | lightcraft_engine::pipeline::OutputDepth::F32Linear)
+            || p.get("ppi").is_some()
+            || opts.border.is_some();
+        if !ExportOptions::has_size_param(p) && !print_master {
             opts.resize = Some(Resize::long_edge(3000));
         }
         let exact = p.get("path").and_then(Value::as_str);

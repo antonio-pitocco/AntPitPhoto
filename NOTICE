@@ -61,3 +61,13 @@ downloads cities15000.zip, admin1CodesASCII.txt and countryInfo.txt from GeoName
 (https://download.geonames.org/export/dump/) into the settings folder. GeoNames data is licensed
 under Creative Commons Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/);
 attribution: "GeoNames, geonames.org". The lookup code (crates/geocode) is our own.
+
+AntPitPhoto
+Copyright (c) 2026 Antonio Pitocco (AntPitLab).
+AntPitPhoto is a modified version of LightCraft (https://github.com/storytold/lightcraft,
+Copyright (c) 2026 ArtCraft Team and the LightCraft contributors), distributed under the same
+licences, MIT OR Apache-2.0 at your option. Changes (2026): Italian interface catalogs, exhibition
+export presets, print size in centimetres, printed paper border, full-size headless print exports,
+the AntPitPhoto name and icon (assets/app-icon/antpitphoto/, original artwork). See
+docs/antpitphoto.md. AntPitPhoto is not affiliated with or endorsed by the LightCraft or ArtCraft
+authors.
