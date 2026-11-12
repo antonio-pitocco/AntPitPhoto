@@ -1,8 +1,9 @@
 //! Sony's plain raw-IFD distortion table, expressed as a DNG warp for the shared optics pipeline.
 //!
 //! Tag identity/layout: https://exiftool.org/TagNames/EXIF.html (`0x7037`, signed shorts).
-//! Geometry inferred independently from files and Sony Imaging Edge exports; see docs/sony-lens-corrections.md.
-//! No lens database or external decoder code. The unrelated MakerNote table has a different scale.
+//! Geometry inferred independently from files, Sony Imaging Edge exports and the cameras' own JPEGs; see
+//! docs/sony-lens-corrections.md. No lens database or external decoder code. The unrelated MakerNote table has a
+//! different scale.
 
 use crate::{Opcode, Rect};
 use lightcraft_tiff::{Ifd, Value};
@@ -11,21 +12,35 @@ const DISTORTION: u16 = 0x7037;
 const SAMPLES: usize = 1024;
 const MAX_ERROR: f64 = 0.0005;
 
-/// Only independently validated camera models and the 16-entry layout. Unknown models/layouts
-/// and implausible/non-smooth maps are left uncorrected. See docs/sony-lens-corrections.md.
+/// Independently validated camera models, each with the knot count its files carry (the tag's first value; the
+/// tag always holds 17 values, an 11-knot table is padded with zeros). Unknown models/layouts and implausible or
+/// non-smooth maps are left uncorrected. See docs/sony-lens-corrections.md.
+/// - ILCE-7RM4A: Imaging Edge On/Off exports, FE 24-105 and FE 200-600.
+/// - ILCE-7C: the camera's embedded JPEG with distortion correction forced by the lens (FE 28-60 at 28, 50 and 60 mm).
+/// - DSC-RX10M5: the camera's full-size JPEG with correction Auto (24, 103 and 600 mm equivalent).
+const VALIDATED: &[(&str, usize)] = &[("ILCE-7RM4A", 16), ("ILCE-7C", 16), ("DSC-RX10M5", 11)];
+
+/// The validated table of `model`: its knots, evenly spaced from the centre (0) to the corner (1).
+fn table<'a>(model: &str, ifd: &'a Ifd) -> Option<&'a [i16]> {
+    let &(_, knots) = VALIDATED.iter().find(|(m, _)| *m == model)?;
+    let Value::SShort(values) = &ifd.get(DISTORTION)?.value else { return None };
+    let (&count, rest) = values.split_first()?;
+    if values.len() != 17 || usize::try_from(count).ok()? != knots {
+        return None;
+    }
+    let (table, padding) = rest.split_at(knots);
+    if padding.iter().any(|v| *v != 0) || table.iter().all(|v| *v == 0) || table.iter().any(|v| !(-4096..=4096).contains(v)) {
+        return None;
+    }
+    Some(table)
+}
+
 /// A camera setting of Off does not remove the lens data: the user can enable it in the developer.
 pub(super) fn distortion(model: &str, ifd: &Ifd, active: Rect, crop: Rect) -> Option<Opcode> {
     // A matching table shape does not establish its scale or radial normalization on another body.
     // Keep this exact: ILCE-7RM4 and ILCE-7RM4A are distinct models, not interchangeable aliases.
-    if model != "ILCE-7RM4A" {
-        return None;
-    }
-    let Value::SShort(values) = &ifd.get(DISTORTION)?.value else { return None };
-    let [16, table @ ..] = values.as_slice() else { return None };
-    let table: &[i16; 16] = table.try_into().ok()?;
-    if table.iter().all(|v| *v == 0) || table.iter().any(|v| !(-4096..=4096).contains(v)) {
-        return None;
-    }
+    let table = table(model, ifd)?;
+    let last = table.len() - 1;
     let crop = crop.clipped(active.width, active.height);
     if active.width < 2 || active.height < 2 || crop.width < 2 || crop.height < 2 {
         return None;
@@ -37,8 +52,8 @@ pub(super) fn distortion(model: &str, ifd: &Ifd, active: Rect, crop: Rect) -> Op
     }
     // Interpolate fractional radial scale at evenly spaced radii from centre to cropped corner.
     let scale = |r: f64| {
-        let at = r.clamp(0.0, 1.0) * 15.0;
-        let i = (at.floor() as usize).min(14);
+        let at = r.clamp(0.0, 1.0) * last as f64;
+        let i = (at.floor() as usize).min(last - 1);
         let a = f64::from(table[i]);
         let b = f64::from(table[i + 1]);
         1.0 + (a + (b - a) * (at - i as f64)) / 16384.0
@@ -48,7 +63,7 @@ pub(super) fn distortion(model: &str, ifd: &Ifd, active: Rect, crop: Rect) -> Op
     // Zoom until the entire rectangular output boundary is inside the source. For a piecewise-linear
     // scale its maximum on that boundary occurs at its nearest radius or at one of the remaining knots.
     let nearest = cw.min(ch) / diagonal;
-    let max_scale = (0..16).map(|i| i as f64 / 15.0).filter(|&r| r >= nearest).map(scale).fold(scale(nearest), f64::max);
+    let max_scale = (0..=last).map(|i| i as f64 / last as f64).filter(|&r| r >= nearest).map(scale).fold(scale(nearest), f64::max);
     let zoom = 1.0 / max_scale;
     let basis = |r: f64| {
         let r2 = r * r;
@@ -181,6 +196,75 @@ mod tests {
         assert!(distortion("ILCE-7RM4A", &table(&TELE), AREA, Rect::new(0, 0, 9504, 5346)).is_none());
         assert!(distortion("ILCE-7RM4A", &table(&TELE), AREA, Rect::new(99999, 0, 10, 10)).is_none());
     }
+    /// An 11-knot table as the DSC-RX10M5 writes it: count, knots, zero padding to 17 values.
+    fn table11(values: &[i16; 11]) -> Ifd {
+        ifd(Value::SShort(std::iter::once(11).chain(values.iter().copied()).chain([0; 5]).collect()))
+    }
+    /// DSC-RX10M5 tables (24, 103 and 600 mm equivalent) and the zoom fitted, with the table's own radial shape, to
+    /// SIFT correspondences between the uncorrected raw render and the camera's full-size JPEG (correction Auto).
+    const RX10M5: [([i16; 11], f64); 3] = [
+        ([749, 717, 636, 506, 334, 129, -103, -363, -643, -917, -1179], 1.00050),
+        ([-838, -830, -807, -769, -714, -641, -553, -446, -317, -167, 0], 0.99971),
+        ([-839, -832, -809, -770, -714, -642, -554, -448, -320, -169, 0], 0.99952),
+    ];
+    const RX10M5_AREA: Rect = Rect { x: 12, y: 8, width: 5472, height: 3648 };
+
+    fn radius(planes: &[[f64; 6]], r: f64) -> f64 {
+        let k = planes[0];
+        r * (k[0] + r * r * (k[1] + r * r * (k[2] + r * r * k[3])))
+    }
+
+    #[test]
+    fn rx10m5_eleven_knot_tables_match_the_camera_jpeg_geometry() {
+        let active = Rect::new(0, 0, 5504, 3664);
+        for (values, zoom) in RX10M5 {
+            let Opcode::WarpRectilinear { planes, .. } = distortion("DSC-RX10M5", &table11(&values), active, RX10M5_AREA).unwrap() else {
+                panic!("warp")
+            };
+            // the opcode is normalised to the farthest active-area corner; undo that to compare in crop half diagonals
+            let (cw, ch) = (5471.0f64, 3647.0f64);
+            let (cx, cy) = (12.0 + cw / 2.0, 8.0 + ch / 2.0);
+            let ratio = cx.max(5503.0 - cx).hypot(cy.max(3663.0 - cy)) / (cw.hypot(ch) / 2.0);
+            for i in 0..=95 {
+                let r = i as f64 / 100.0;
+                let at = r * 10.0;
+                let j = (at.floor() as usize).min(9);
+                let t = f64::from(values[j]) + f64::from(values[j + 1] - values[j]) * (at - j as f64);
+                let measured = r * zoom * (1.0 + t / 16384.0);
+                let ours = radius(&planes, r / ratio) * ratio;
+                // 0.001 half diagonals is 3.3 px on the 5472 px frame; the median residual of the fit was under 1 px
+                assert!((ours - measured).abs() < 0.001, "{values:?} r={r}: {ours} vs {measured}");
+            }
+        }
+    }
+
+    #[test]
+    fn ilce7c_sixteen_knot_table_matches_the_camera_jpeg_zoom() {
+        // FE 28-60 at 28 mm, correction forced by the lens: the zoom fitted to the embedded JPEG was 1.0288.
+        let wide = [7, 0, -29, -61, -115, -172, -252, -334, -431, -532, -647, -758, -884, -1003, -1132, -1258];
+        let area = Rect::new(0, 0, 6048, 4024);
+        let Opcode::WarpRectilinear { planes, .. } = distortion("ILCE-7C", &table(&wide), area, area).unwrap() else { panic!("warp") };
+        // k0 is the source radius per output radius at the centre: zoom × (1 + 7 / 16384)
+        assert!((planes[0][0] - 1.0288).abs() < 0.001, "{:?}", planes[0]);
+    }
+
+    #[test]
+    fn knot_count_must_match_the_model_and_padding_must_be_zero() {
+        let wide = RX10M5[0].0;
+        assert!(distortion("DSC-RX10M5", &table11(&wide), AREA, AREA).is_some());
+        // an 11-knot table on a 16-knot body, and the reverse
+        assert!(distortion("ILCE-7RM4A", &table11(&wide), AREA, AREA).is_none());
+        assert!(distortion("ILCE-7C", &table11(&wide), AREA, AREA).is_none());
+        assert!(distortion("DSC-RX10M5", &table(&TELE), AREA, AREA).is_none());
+        // the same body family with a different lens is not validated
+        assert!(distortion("DSC-RX10M4", &table11(&wide), AREA, AREA).is_none());
+        assert!(distortion("DSC-RX100M3", &table11(&wide), AREA, AREA).is_none());
+        let padded = ifd(Value::SShort([11].into_iter().chain(wide).chain([0, 0, 0, 0, 7]).collect()));
+        assert!(distortion("DSC-RX10M5", &padded, AREA, AREA).is_none());
+        let short = ifd(Value::SShort([11].into_iter().chain(wide).collect()));
+        assert!(distortion("DSC-RX10M5", &short, AREA, AREA).is_none());
+    }
+
     #[test]
     fn refuses_unvalidated_models_even_with_a_valid_table() {
         let valid = table(&TELE);

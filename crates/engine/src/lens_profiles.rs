@@ -2,7 +2,9 @@
 //!
 //! When a raw carries no lens correction of its own (DNG opcodes, or a camera correction a raw reader converts,
 //! [`crate::files::embedded_lens`]), the lens named in its EXIF is looked up in a lensfun-format database: the
-//! directory in `LIGHTCRAFT_LENSFUN_DIR` (e.g. lensfun's `data/db`, CC-BY-SA, which is never bundled with the app).
+//! directory in `LIGHTCRAFT_LENSFUN_DIR` (e.g. lensfun's `data/db`, CC-BY-SA, which is never bundled with the app), else
+//! `lensfun` in LightCraft's configuration folder ([`crate::config::config_dir`]; on macOS
+//! `~/Library/Application Support/LightCraft/lensfun`), so an app opened from the Finder finds it too.
 //! The profile is converted to the same [`lightcraft_develop::EmbeddedLens`] form, so "Enable Profile Corrections", its
 //! amount sliders, the GPU path and DNG export treat both alike. Without the variable nothing changes.
 use std::path::PathBuf;
@@ -14,11 +16,23 @@ use lightcraft_lensdb::{LensDb, Shot};
 /// The environment variable naming the lens database directory.
 pub const ENV: &str = "LIGHTCRAFT_LENSFUN_DIR";
 
+/// The folder the database is read from: `LIGHTCRAFT_LENSFUN_DIR`, else `<config>/lensfun` when that folder exists.
+pub fn dir() -> Option<PathBuf> {
+    dir_with(std::env::var_os(ENV), crate::config::config_dir())
+}
+
+fn dir_with(env: Option<std::ffi::OsString>, config: Option<PathBuf>) -> Option<PathBuf> {
+    match env {
+        Some(d) => (!d.is_empty()).then(|| PathBuf::from(d)),
+        None => config.map(|c| c.join("lensfun")).filter(|d| d.is_dir()),
+    }
+}
+
 /// The configured database, read once per process; `None` when none is configured or it holds no lenses.
 pub fn database() -> Option<&'static LensDb> {
     static DB: OnceLock<Option<LensDb>> = OnceLock::new();
     DB.get_or_init(|| {
-        let dir = PathBuf::from(std::env::var_os(ENV)?);
+        let dir = dir()?;
         match LensDb::load_dir(&dir) {
             Ok((db, errors)) => {
                 for (file, e) in errors {
@@ -93,6 +107,20 @@ mod tests {
             f_number: Some(3.5),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_folder_comes_from_the_variable_else_the_configuration_folder() {
+        let tmp = std::env::temp_dir().join(format!("lc-lensfun-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("lensfun")).unwrap();
+        assert_eq!(dir_with(Some("/x".into()), Some(tmp.clone())), Some(PathBuf::from("/x")));
+        // an empty variable switches the database off
+        assert_eq!(dir_with(Some("".into()), Some(tmp.clone())), None);
+        assert_eq!(dir_with(None, Some(tmp.clone())), Some(tmp.join("lensfun")));
+        // no folder there: nothing (no warning on every start)
+        assert_eq!(dir_with(None, Some(tmp.join("missing"))), None);
+        assert_eq!(dir_with(None, None), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

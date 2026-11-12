@@ -9,9 +9,13 @@ stays a separate download. Adobe LCP profiles are never used.
 
 1. Get the lensfun database (the `data/db/*.xml` files of <https://github.com/lensfun/lensfun>, or the copy a Linux
    distribution installs under `/usr/share/lensfun/version_1/`).
-2. Point `LIGHTCRAFT_LENSFUN_DIR` at that directory and start the app (or the CLI).
+2. Copy the `.xml` files into `lensfun` in LightCraft's configuration folder (macOS:
+   `~/Library/Application Support/LightCraft/lensfun`; Windows: `%APPDATA%\LightCraft\lensfun`; elsewhere
+   `~/.config/lightcraft/lensfun`), or point `LIGHTCRAFT_LENSFUN_DIR` at the directory. The variable wins; set it
+   empty to switch the database off. The configuration folder also works for an app opened from the Finder, which
+   does not see the variables of a shell.
 
-Files are read once per process. Invalid files are skipped with a warning in the log. Without the variable nothing
+Files are read once per process. Invalid files are skipped with a warning in the log. Without either nothing
 changes.
 
 ## What is applied

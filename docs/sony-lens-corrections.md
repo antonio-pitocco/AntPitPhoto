@@ -1,12 +1,14 @@
 # Sony embedded distortion corrections
 
-LightCraft reads the signed 16-sample distortion table in the raw image IFD (`0x7037`) of
-Sony **ILCE-7RM4A (A7R IVA)** Bayer ARWs. Other camera models are deliberately left uncorrected,
-even when they contain a table with the same layout.
+LightCraft reads the signed distortion table in the raw image IFD (`0x7037`) of Sony Bayer ARWs from
+**ILCE-7RM4A (A7R IVA)** and **ILCE-7C (A7C)** (16 samples) and **DSC-RX10M5 (RX10 V)** (11 samples).
+Other camera models are deliberately left uncorrected, even when they contain a table with the same layout.
 It converts that table into `OpcodeList3` / `WarpRectilinear`, so the existing profile correction control,
 CPU/GPU optics path, EXIF orientation handling, and DNG export use the same correction.
 
-This adds **distortion only**. Sony vignetting and lateral chromatic-aberration tables are not decoded.
+This adds **distortion only**. Sony vignetting (`0x7032`) and lateral chromatic-aberration (`0x7035`) tables are
+read in the measurements below but not applied: on these bodies the camera JPEG shows neither correction relative
+to LightCraft's render (see "Vignetting and chromatic aberration").
 The enabled and independently validated model is ILCE-7RM4A with the FE 24–105mm F4 G OSS and
 FE 200–600mm F5.6–6.3 G OSS. Linear YCbCr ARWs and non-3:2 camera crops are excluded pending validation. An aspect crop may
 retain the full-frame radial normalization; the decoder does not guess that relationship. Older files that carry
@@ -91,6 +93,44 @@ The distortion geometry remains aligned while every body's image framing follows
 Tests cover signedness/length rejection, zero and malformed tables, independent 600 mm reference
 geometry, barrel framing, offset crop normalization, both TIFF byte orders, header/full consistency,
 and preservation through DNG export. No private photographs or reference TIFFs are committed.
+
+## ILCE-7C and DSC-RX10M5 (2026-11-12, AntPitLab)
+
+The same formula, with the knots evenly spaced from centre (0) to corner (1) whatever their number, describes both
+bodies. The DSC-RX10M5 writes 11 knots (the tag's first value), padded with zeros to the same 17 values; the code
+accepts exactly the knot count recorded for each validated model and refuses non-zero padding. The automatic
+frame-filling zoom is the same: on the RX10 V tables it comes out at 0.9999–1.0, i.e. the table already carries
+its own scale (the 24 mm centre value 749 is that scale).
+
+Evidence: SIFT correspondences (OpenCV, 7k–14k matches per frame) between LightCraft's uncorrected render and the
+camera's own corrected JPEG of the same frame, fitted with the table's radial shape and only a free zoom (fixed
+centre at the crop centre). Pixels at the JPEG's full size.
+
+| Body / lens / focal length | Camera setting | Uncorrected median | Fitted zoom (formula's) | Median / p95 residual |
+|---|---|---:|---:|---:|
+| RX10 V, 24 mm eq. | Auto, full-size JPEG 5472 px | 24.2 px | 1.0005 (0.9999) | 0.78 / 1.85 px |
+| RX10 V, 103 mm eq. | Auto, full-size JPEG | 15.9 px | 0.9997 (1.0) | 0.80 / 1.66 px |
+| RX10 V, 600 mm eq. | Auto, full-size JPEG | 6.4 px | 0.9995 (1.0) | 0.86 / 1.45 px |
+| A7C, FE 28–60 at 28 mm | forced by the lens, 1616 px preview | — | 1.0288 (1.0291) | 0.32 / 0.89 px |
+| A7C, FE 28–60 at 50 mm | forced by the lens | — | 0.9992 | 0.32 / 0.83 px |
+| A7C, FE 28–60 at 60 mm | forced by the lens | — | 0.9998 | 0.27 / 0.77 px |
+
+Freeing the centre lowers the RX10 V medians to 0.3–0.4 px with an offset of about 10–18 px that is not the same
+on the three frames (not recorded in the file), so the centre stays at the crop centre. Freeing the table's scale
+or knot spacing changes the residual by less than 0.05 px: the layout and the 1/16384 scale are the camera's.
+The A7C's other lenses (85 GM II, Tamron 28–75, 35 GM) record the correction Off, so their JPEGs cannot certify the
+warp; the body and its 16-knot format are what was validated, as for the A7R IVA. Unit tests pin the three RX10 V
+tables to the JPEG-fitted geometry and the A7C 28 mm zoom. No photograph is committed.
+
+### Vignetting and chromatic aberration
+
+With the geometry aligned, the median ratio of the camera JPEG to LightCraft's render per radial ring (linearised,
+mid-tones) stays within ±0.1 in log units from centre to corner on all six frames, where the vignetting table would
+predict 0.3–0.9 at the corner under any of the scales tried (`1 + v/16384`, `2^(v/16384)`, `2^(v/8192)`,
+`1 + v/8192`). The camera applies no shading on top of what the raw already has, so the table is not applied:
+it would brighten the corners past the camera's rendition. LightCraft's render already registers the colour planes:
+the radial red/blue shift against green is at most 0.36 px at 5472 px (RX10 V 24 mm red; 0.06–0.12 px elsewhere),
+like the camera JPEG's 0.06 px, so the CA table is not applied either (as for Fujifilm).
 
 ## Camera coverage and regression boundary
 
