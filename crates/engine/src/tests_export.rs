@@ -137,11 +137,32 @@ fn presets_conflicts_and_subfolders() {
     let (files, written) = batch(&mut s, &ids, &o);
     assert_eq!(written, ["out/Sub/LC01347-2.png", "out/Sub/LC01347-3.png"]);
     assert_eq!(files[0]["width"], 32);
+    // and each says so: the name it would have had was taken
+    assert_eq!(files[0]["renamedFrom"], "out/Sub/LC01347.png");
+    assert_eq!(files[1]["renamedFrom"], "out/Sub/LC01347.png");
+    assert!(files[0].get("replaced").is_none());
     let (files, written) = batch(&mut s, &ids, &ExportOptions { conflict: crate::export::Conflict::Skip, ..o.clone() });
     assert_eq!(files.iter().filter(|f| f["skipped"] == "out/Sub/LC01347.png").count(), 2, "{files:?}");
     assert!(written.is_empty());
-    let (_, written) = batch(&mut s, &ids[..1], &ExportOptions { conflict: crate::export::Conflict::Overwrite, ..o });
+    let (files, written) = batch(&mut s, &ids[..1], &ExportOptions { conflict: crate::export::Conflict::Overwrite, ..o });
     assert_eq!(written, ["out/Sub/LC01347.png"]);
+    assert_eq!(files[0]["replaced"], true, "an overwrite is reported: {files:?}");
+}
+
+#[test]
+fn render_preview_writes_what_an_export_would() {
+    let mut s = Session::with_demo();
+    let dir = std::env::temp_dir().join(format!("lc-render-preview-{}", std::process::id()));
+    let path = dir.join("p.png").to_string_lossy().to_string();
+    let r = s.execute("develop.renderPreview", &json!({"path": path, "size": 64})).unwrap();
+    assert_eq!(r["path"], path.as_str());
+    assert_eq!(r["width"].as_u64().unwrap().max(r["height"].as_u64().unwrap()), 64);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"));
+    assert!(s.execute("develop.renderPreview", &json!({"path": dir.join("p.gif").to_string_lossy()})).is_err());
+    assert!(s.execute("develop.renderPreview", &json!({"size": 64})).is_err());
+    assert!(s.execute("develop.renderPreview", &json!({"path": path, "size": -1})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -790,6 +790,12 @@ pub struct ExportOptions {
     pub hdr_transfer: HdrCurve,
     /// Paper margin around the picture (AntPitLab, exhibition prints); `None` = none.
     pub border: Option<Border>,
+    /// An RGB printer + paper ICC profile (path): the file is converted into it and tagged with it,
+    /// ready for the printer driver with its colour management off (a home print proof). JPEG,
+    /// PNG and TIFF, 8 or 16 bits.
+    pub print_profile: Option<String>,
+    /// Rendering intent of that conversion.
+    pub print_intent: lightcraft_codecs::proof::ProofIntent,
 }
 
 impl Default for ExportOptions {
@@ -821,6 +827,8 @@ impl Default for ExportOptions {
             photos_album: String::new(),
             hdr_transfer: HdrCurve::Pq,
             border: None,
+            print_profile: None,
+            print_intent: lightcraft_codecs::proof::ProofIntent::Perceptual,
         }
     }
 }
@@ -865,6 +873,8 @@ pub const OPTION_PARAMS: &[&str] = &[
     "hdrTransfer",
     "printCm",
     "border",
+    "printProfile",
+    "printIntent",
 ];
 
 /// Why an export can't add its files to Apple Photos on this platform (`None`: it can, when the
@@ -1062,6 +1072,10 @@ impl ExportOptions {
                         num(k, s, 0.5, 1000.0)?;
                     }
                 }
+                "printProfile" => {
+                    string(cmd, k, v)?;
+                }
+                "printIntent" => one_of(k, v, &["perceptual", "relative"])?,
                 "border" => match v {
                     Value::Number(_) => {
                         num(k, v, 0.0, BORDER_MAX_CM)?;
@@ -1207,6 +1221,8 @@ impl ExportOptions {
             photos_album: s("photosAlbum").map_or(d.photos_album, |a| a.trim().to_string()),
             hdr_transfer: s("hdrTransfer").and_then(HdrCurve::parse).unwrap_or(d.hdr_transfer),
             border: p.get("border").and_then(border_from_json),
+            print_profile: s("printProfile").map(str::trim).filter(|v| !v.is_empty()).map(str::to_string),
+            print_intent: s("printIntent").and_then(lightcraft_codecs::proof::ProofIntent::parse).unwrap_or(d.print_intent),
         }
     }
 
@@ -1460,9 +1476,13 @@ pub fn encode_image(img: &Rgba8, o: &ExportOptions) -> Result<Vec<u8>, String> {
 
 /// Like [`encode_image`], embedding `meta` (already filtered by the policy) as EXIF + XMP.
 pub fn encode_with_metadata(img: &Rgba8, o: &ExportOptions, meta: Option<&Metadata>) -> Result<Vec<u8>, String> {
-    let img = finish_8bit(img, o);
+    let mut img = finish_8bit(img, o);
     let space = o.effective_space();
-    let profile = icc::write_named(named_space(space));
+    let mut profile = icc::write_named(named_space(space));
+    if let Some(printer) = print_profile(o)? {
+        printer.convert8(named_space(space), img.data.as_flattened_mut())?;
+        profile = printer.bytes;
+    }
     let exif = meta.map(lightcraft_meta::write_exif);
     let xmp = meta.map(|m| lightcraft_meta::write_xmp(m, None));
     let meta = EncodeMeta { icc: Some(&profile), exif: exif.as_deref(), xmp: xmp.as_deref(), ppi: Some(o.ppi) };
@@ -1522,6 +1542,21 @@ fn finish_8bit(img: &Rgba8, o: &ExportOptions) -> Rgba8 {
         img = Rgba8 { width: w, height: h, data };
     }
     img
+}
+
+/// The printer profile `o` converts into, read and checked (`None` without one). Only JPEG, PNG
+/// and TIFF are written for printing.
+fn print_profile(o: &ExportOptions) -> Result<Option<lightcraft_codecs::proof::PrintProfile>, String> {
+    let Some(path) = o.print_profile.as_deref() else { return Ok(None) };
+    if !matches!(o.format, ExportFormat::Jpeg | ExportFormat::Png | ExportFormat::Tiff) {
+        return Err("a printer profile is applied to JPEG, PNG or TIFF files only".into());
+    }
+    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if meta.len() > lightcraft_codecs::display::MAX_PROFILE_BYTES as u64 {
+        return Err(format!("{path}: too large for an ICC profile"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    lightcraft_codecs::proof::PrintProfile::new(&bytes, o.print_intent).map(Some).map_err(|e| format!("{path}: {e}"))
 }
 
 /// Output sharpening and the watermark on a high-bit-depth render.
@@ -1624,11 +1659,19 @@ pub fn encode_rendered(r: &lightcraft_pipeline::Rendered, o: &ExportOptions, met
 /// Encode a high-bit-depth image (see [`encode_rendered`]).
 pub fn encode_deep(img: &DeepImage, o: &ExportOptions, meta: Option<&Metadata>) -> Result<Vec<u8>, String> {
     let meta_src = meta;
-    let img = finish_deep(img, o);
-    let profile = match img.samples {
+    let mut img = finish_deep(img, o);
+    let mut profile = match img.samples {
         DeepSamples::F32(_) => icc::write_matrix_trc(&img.space.rgb_space(), &lightcraft_codecs::Trc::Linear),
         DeepSamples::U16(_) => icc::write_named(named_space(img.space)),
     };
+    if let Some(printer) = print_profile(o)? {
+        let space = named_space(img.space);
+        match &mut img.samples {
+            DeepSamples::U16(v) => printer.convert16(space, v)?,
+            DeepSamples::F32(_) => return Err("a printer profile needs an 8- or 16-bit file".into()),
+        }
+        profile = printer.bytes;
+    }
     let exif = meta.map(lightcraft_meta::write_exif);
     let xmp = meta.map(|m| lightcraft_meta::write_xmp(m, None));
     let meta = EncodeMeta { icc: Some(&profile), exif: exif.as_deref(), xmp: xmp.as_deref(), ppi: Some(o.ppi) };
@@ -2317,6 +2360,8 @@ impl<'a> Placer<'a> {
         };
         // the exported file and its sidecars
         let group = |main: &str| std::iter::once(main.to_string()).chain(e.sidecars.iter().map(|(x, _)| sidecar_path(main, x))).collect::<Vec<_>>();
+        // the name the file would have had, when another was picked because it was taken
+        let mut renamed_from = None;
         let path = match self.to.exact.as_deref().filter(|_| self.single) {
             Some(p) => Ok(p.to_string()),
             None => {
@@ -2335,6 +2380,7 @@ impl<'a> Placer<'a> {
                         Conflict::Unique => {
                             let (stem, ext) = e.file_name.rsplit_once('.').map_or((e.file_name.as_str(), None), |(a, b)| (a, Some(b)));
                             let name = |n: usize| join_path(dir, &ext.map_or(format!("{stem}-{n}"), |x| format!("{stem}-{n}.{x}")));
+                            renamed_from = Some(path.clone());
                             (2..1_000_000).map(name).find(|p| !busy(p)).ok_or_else(|| format!("{path}: no free file name"))
                         }
                     }
@@ -2349,18 +2395,26 @@ impl<'a> Placer<'a> {
             for f in &files {
                 guard.check(std::path::Path::new(f))?;
             }
+            // an earlier file at this path (not one this batch just wrote) is replaced: say so
+            let replaced = !self.taken.contains(&path) && exists(&path);
             write(&path, &e.bytes)?;
             let mut sidecars = Vec::new();
             for ((_, bytes), sc) in e.sidecars.iter().zip(files.iter().skip(1)) {
                 write(sc, bytes)?;
                 sidecars.push(sc.clone());
             }
-            Ok((path, files, sidecars))
+            Ok((path, files, sidecars, replaced))
         });
         match written {
-            Ok((path, files, sidecars)) => {
+            Ok((path, files, sidecars, replaced)) => {
                 self.taken.extend(files);
                 let mut entry = json!({"path": path, "width": e.width, "height": e.height, "bytes": e.bytes.len(), "sidecars": sidecars});
+                if replaced {
+                    entry["replaced"] = json!(true);
+                }
+                if let Some(from) = renamed_from {
+                    entry["renamedFrom"] = json!(from);
+                }
                 if let Some(why) = &e.gpu_fallback {
                     entry["gpuFallback"] = json!(why);
                 }

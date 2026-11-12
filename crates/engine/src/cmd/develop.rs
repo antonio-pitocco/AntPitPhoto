@@ -242,6 +242,15 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(())
             })
         }),
+        cmd!(
+            query "develop.renderPreview",
+            "Render Preview to File",
+            [],
+            None,
+            "{path: output file (.jpg/.png/.tif/.webp), size?: long edge in pixels (default 1600; 0 = full size)} — the active photo as an export renders it (every mask and matte at full quality), written without metadata or output sharpening; the file is replaced when it exists",
+            has_active,
+            render_preview
+        ),
         cmd!("develop.merge", "Apply Settings JSON", [], None, "{settings: partial DevelopSettings JSON, label?}", has_active, |s, p| {
             let partial = p.get("settings").cloned().ok_or_else(|| bad("develop.merge", "missing settings"))?;
             let label = str_param(p, "label").unwrap_or("Edit").to_string();
@@ -1164,4 +1173,35 @@ fn has_history_after(s: &Session) -> std::result::Result<(), String> {
     } else {
         Err("at the latest History step".into())
     }
+}
+
+/// `develop.renderPreview`: the active photo rendered by the export pipeline (so what is written is
+/// what an export would hold, unlike a screenshot taken while finer masks are still being made),
+/// at `size` pixels on the long edge, into `path`.
+fn render_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "develop.renderPreview";
+    let id = active(s, C)?;
+    let path = str_param(p, "path").filter(|p| !p.trim().is_empty()).ok_or_else(|| bad(C, "missing `path`"))?.to_string();
+    let size = match p.get("size") {
+        None | Some(Value::Null) => 1600,
+        Some(v) => v.as_u64().filter(|n| *n <= 65_535).ok_or_else(|| bad(C, "`size` must be a whole number of pixels 0..65535"))?,
+    };
+    let ext = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let format = match ext.as_str() {
+        "jpg" | "jpeg" => "jpeg",
+        "png" => "png",
+        "tif" | "tiff" => "tiff",
+        "webp" => "webp",
+        _ => return Err(bad(C, "`path` must end in .jpg, .png, .tif or .webp")),
+    };
+    let opts = crate::export::ExportOptions::from_params(&json!({"format": format, "longEdge": size, "quality": 95, "metadata": "none"}))
+        .map_err(|e| bad(C, e.to_string()))?;
+    s.check_write_target(&path).map_err(|e| bad(C, e))?;
+    let e = crate::export::export_photo(s, id, &opts, 1).map_err(|e| bad(C, e))?;
+    crate::export::write_file(&path, &e.bytes).map_err(|e| bad(C, e))?;
+    let mut out = json!({"path": path, "width": e.width, "height": e.height, "bytes": e.bytes.len()});
+    if let Some(why) = e.gpu_fallback {
+        out["gpuFallback"] = json!(why);
+    }
+    Ok(out)
 }

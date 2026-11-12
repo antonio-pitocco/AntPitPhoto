@@ -20,7 +20,8 @@ use moxcms::{ColorProfile, DataColorSpace, Layout, RenderingIntent, TransformOpt
 use crate::display::MAX_PROFILE_BYTES;
 
 /// Rendering intent of the forward (image → device) conversion.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ProofIntent {
     #[default]
     Perceptual,
@@ -111,6 +112,63 @@ pub fn proof_table(bytes: &[u8], intent: ProofIntent, paper_ink: bool) -> Result
     Ok(ProofTable { n, data, description })
 }
 
+/// An RGB output-device profile (a printer with a paper) to convert prints into, checked and
+/// parsed once: [`PrintProfile::convert8`] / [`PrintProfile::convert16`] then take an image's
+/// samples from a named working space into the device's RGB, as the printer driver expects them
+/// with its own colour management off. CMYK and grey profiles are refused (the drivers of photo
+/// printers take RGB).
+pub struct PrintProfile {
+    dev: ColorProfile,
+    intent: RenderingIntent,
+    /// The profile's bytes, embedded in the converted file.
+    pub bytes: Vec<u8>,
+    /// The profile's description, when it has one.
+    pub description: Option<String>,
+}
+
+impl PrintProfile {
+    pub fn new(bytes: &[u8], intent: ProofIntent) -> Result<PrintProfile, String> {
+        if bytes.len() > MAX_PROFILE_BYTES {
+            return Err("the profile is too large".into());
+        }
+        let dev = guarded(|| ColorProfile::new_from_slice(bytes).ok()).ok_or("not a valid ICC profile")?;
+        if dev.color_space != DataColorSpace::Rgb {
+            return Err("only RGB printer profiles can be printed to (the printer driver takes RGB)".into());
+        }
+        let intent = match intent {
+            ProofIntent::Perceptual => RenderingIntent::Perceptual,
+            ProofIntent::Relative => RenderingIntent::RelativeColorimetric,
+        };
+        Ok(PrintProfile { dev, intent, bytes: bytes.to_vec(), description: crate::icc::parse(bytes).and_then(|i| i.description) })
+    }
+
+    fn source(src: crate::space::NamedSpace) -> Result<ColorProfile, String> {
+        guarded(|| ColorProfile::new_from_slice(&crate::icc::write_named(src)).ok()).ok_or_else(|| "can't read the working profile".to_string())
+    }
+
+    fn options(&self) -> TransformOptions {
+        TransformOptions { rendering_intent: self.intent, ..TransformOptions::default() }
+    }
+
+    /// Convert interleaved 8-bit RGBA samples (alpha kept) encoded in `src` to the device.
+    pub fn convert8(&self, src: crate::space::NamedSpace, rgba: &mut [u8]) -> Result<(), String> {
+        let from = Self::source(src)?;
+        let t = guarded(|| from.create_transform_8bit(Layout::Rgba, &self.dev, Layout::Rgba, self.options()).ok())
+            .ok_or("can't convert to this printer profile")?;
+        let input = rgba.to_vec();
+        guarded(|| t.transform(&input, rgba).ok()).ok_or_else(|| "the printer profile's tables can't be applied".to_string())
+    }
+
+    /// Convert interleaved 16-bit RGB samples encoded in `src` to the device.
+    pub fn convert16(&self, src: crate::space::NamedSpace, rgb: &mut [u16]) -> Result<(), String> {
+        let from = Self::source(src)?;
+        let t = guarded(|| from.create_transform_16bit(Layout::Rgb, &self.dev, Layout::Rgb, self.options()).ok())
+            .ok_or("can't convert to this printer profile")?;
+        let input = rgb.to_vec();
+        guarded(|| t.transform(&input, rgb).ok()).ok_or_else(|| "the printer profile's tables can't be applied".to_string())
+    }
+}
+
 /// The paper's white in linear Rec.2020 (screen white = (1, 1, 1)), from the media white point.
 fn paper_white(p: &ColorProfile) -> [f32; 3] {
     let Some(w) = p.media_white_point else { return [1.0; 3] };
@@ -158,6 +216,25 @@ mod tests {
         let (w0, w1) = (at(&plain, [top; 3]), at(&paper, [top; 3]));
         assert!((0..3).all(|k| (w0[k] - 1.0).abs() < 0.01), "{w0:?}");
         assert!(w1[1] < 0.95 && w1[2] < w1[0], "paper white is dimmer and warmer: {w1:?}");
+    }
+
+    #[test]
+    fn prints_convert_into_the_printer_space_and_refuse_cmyk() {
+        // an "Adobe RGB printer": sRGB red becomes Adobe RGB's (less saturated code values)
+        let p = PrintProfile::new(&crate::icc::write_named(NamedSpace::AdobeRgb), ProofIntent::Relative).unwrap();
+        let mut px = [255u8, 0, 0, 255, 128, 128, 128, 255];
+        p.convert8(NamedSpace::Srgb, &mut px).unwrap();
+        assert!(px[0] < 240 && px[1] < 40 && px[3] == 255, "{px:?}");
+        assert!(px[4].abs_diff(128) <= 2 && px[4] == px[5] && px[5] == px[6], "grey stays grey: {px:?}");
+        let mut deep = [65535u16, 0, 0];
+        p.convert16(NamedSpace::Srgb, &mut deep).unwrap();
+        assert!(deep[0] < 62000, "{deep:?}");
+        // the same space is (nearly) the identity
+        let same = PrintProfile::new(&crate::icc::write_named(NamedSpace::Srgb), ProofIntent::Relative).unwrap();
+        let mut q = [200u8, 100, 50, 255];
+        same.convert8(NamedSpace::Srgb, &mut q).unwrap();
+        assert!(q[0].abs_diff(200) <= 1 && q[1].abs_diff(100) <= 1 && q[2].abs_diff(50) <= 1, "{q:?}");
+        assert!(PrintProfile::new(b"nope", ProofIntent::Perceptual).is_err());
     }
 
     #[test]

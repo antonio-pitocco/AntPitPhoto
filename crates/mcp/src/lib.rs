@@ -12,6 +12,7 @@
 //!   `lightcraft-codecs`), so agents can develop photos and look at the result without a window.
 //!
 //! Entry points: [`Server::serve`] (stdio loop) and [`Server::handle_line`] (one message).
+#![recursion_limit = "256"] // the `export` tool's input schema is one large `json!`
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
