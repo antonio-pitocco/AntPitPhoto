@@ -57,11 +57,30 @@ fn rawnind_bayer() -> Known {
     Known { manifest, download: Some(download), entry: Some("model_bayer.onnx") }
 }
 
+/// RawNIND's UtNet2 for linear RGB, from the same archive: the model for raw files that are not Bayer (Fujifilm
+/// X-Trans), which are demosaiced first and denoised in linear Rec.2020. Its answer comes out inverted and scaled by
+/// about three billion; each tile is brought back to the input's scale.
+#[cfg(any(feature = "rawnind-model", test))]
+fn rawnind_linear() -> Known {
+    let bayer = rawnind_bayer();
+    let manifest = DenoiserManifest {
+        id: "rawnind-linear".into(),
+        name: "RawNIND UtNet2 (linear RGB, X-Trans)".into(),
+        sha256: Some("df957efadcc152c007d5d3b0917bdff9e41c0d4a0efe56584ef30b36393cd181".into()),
+        size_bytes: Some(31_053_823),
+        domain: Domain::LinearRgb,
+        gain: Gain::MatchMean { nominal: -3.2e9, max_deviation: 0.15 },
+        ..bayer.manifest
+    };
+    let download = bayer.download.map(|d| Download { id: manifest.id.clone(), file_name: "rawdenoise-nind-linear.dtmodel".into(), ..d });
+    Known { manifest, download, entry: Some("model_linear.onnx") }
+}
+
 /// Every model LightCraft knows.
 pub fn all() -> Vec<Known> {
     #[cfg(feature = "rawnind-model")]
     {
-        vec![rawnind_bayer()]
+        vec![rawnind_bayer(), rawnind_linear()]
     }
     #[cfg(not(feature = "rawnind-model"))]
     {
@@ -89,6 +108,8 @@ mod tests {
         let all = all();
         assert_eq!(all.is_empty(), !cfg!(feature = "rawnind-model"));
         validate(&rawnind_bayer().manifest).unwrap();
+        validate(&rawnind_linear().manifest).unwrap();
+        assert_eq!(rawnind_linear().manifest.domain, Domain::LinearRgb);
         for (i, k) in all.iter().enumerate() {
             validate(&k.manifest).unwrap();
             assert!(all.iter().skip(i + 1).all(|o| o.manifest.id != k.manifest.id), "unique ids");

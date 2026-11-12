@@ -47,8 +47,12 @@ mostra e le loro versioni web.*
   Bayer model can be fetched. Its weights are GPL-3.0: they are downloaded to the Mac at the user's request and
   are not part of the app or of this repository (no permissively licensed model exists for the network the
   denoiser runs; see [denoise.md](denoise.md)). Using them privately has no obligations; passing the model file on
-  falls under the GPL. Fuji X-Trans raws are not denoised yet: the engine runs the
-  Bayer model only.
+  falls under the GPL. Fuji X-Trans raws are denoised by the archive's second model, RawNIND's linear one
+  (`rawnind-linear`, offered beside the Bayer one): the file is demosaiced first (the X-Trans directional
+  demosaic), denoised in white-balanced linear Rec.2020 and brought back to camera RGB, clipped areas kept as
+  recorded. Installed beside the Bayer model, it goes with it (the Bayer model stays the one in use for Bayer
+  files). It runs on the processor only (the graphics-card path takes mosaic models), so a 40 MP X100VI file
+  takes minutes, in the background like the others.
 - **Printer profile on export** — `printProfile` (path of an RGB printer + paper ICC profile) and
   `printIntent` (`perceptual`, default, or `relative`) in `app.export`: the JPEG, PNG or TIFF (8 or
   16 bit) is converted into the printer's space and tagged with its profile, ready for a home
@@ -64,9 +68,49 @@ mostra e le loro versioni web.*
 - **One-click people masks** (Masking panel: Person, Skin, Hair, Clothing): SAM 3 concept prompts
   (`person`; `face, neck, hand`; `hair`; `clothing, coat, jacket, dress, trousers, hat`). From a script:
   `mask.add {"kind": "prompt", "text": "person"}`. They need the SAM 3 model ([ai-masks.md](ai-masks.md)).
-- **Content-aware fill that keeps thin structures**: `spot.add {mode: "fill"}` decides the hole
-  in structure order (exemplar-based inpainting, Criminisi–Pérez–Toyama 2004) before the
-  patch-based completion, so a pole, a cable or a horizon crossing the spot is continued.
+- **Content-aware fill that keeps thin structures and stripes**: `spot.add {mode: "fill"}` decides
+  the hole in structure order (exemplar-based inpainting, Criminisi–Pérez–Toyama 2004) before the
+  patch-based completion, so a pole, a cable or a horizon crossing the spot is continued. Each
+  copy is taken along a shift under which the spot's surroundings repeat (a stripe's period, a
+  pole's own direction; after He–Sun 2012) or continues its neighbour's copy, and patches are
+  compared in a perceptual encoding: stripes run on through the spot in step, and no stray stump
+  of a pole lands in the sea. Limits: the spot must cover the whole object (its feathered rim
+  blends the original back in), and on a busy pattern a piece of a neighbouring object (a ribbon
+  beside the stripes) can still be copied into the spot; a second smaller fill over it, or the
+  Clone mode with a chosen source, finishes the job.
+- **Bright Lights inside a mask** (`mask.adjust {values: {lights: 0..100}}`, Masking panel ▸
+  Bright Lights): a lamp, a neon tube or a window in the frame sits many stops over white, so
+  local Exposure or Whites only move it and it stays clipped. Bright Lights compresses the
+  luminance above a knee 1.5 EV under the photo's own white point into 1.2 EV, however bright the
+  source, and after the tone map rolls the lamp's brightest output channel off from about 218 to
+  at most about 243 (sRGB), scaling the three alike: a coloured neon keeps its colour instead of
+  clipping red. What is under the knee is untouched.
+- **LED Banding** (Detail ▸ LED Banding, `detail.deband` 0–100): removes the dark bands a light
+  flickering with the mains (LEDs, tubes) leaves across a frame taken with the electronic
+  shutter. The bands are measured on the whole frame (the period that explains them best, 2.5
+  to 24 per frame; shorter repeating patterns such as a curtain's folds are left alone) and the
+  darker rows are brought up to the fully lit ones. Rows the light never reached (more than 3 EV
+  down, where only noise is left) are rebuilt from the lit rows either side of the band; those
+  between 2 and 3 EV are blended towards that. Nothing changes on a photo without bands.
+- **A contrast grade for one tonal zone, with the Luminance Range mask** (`mask.add {kind:
+  "luminanceRange", lo, hi, lo_feather?, hi_feather?}`, Masking panel ▸ Luminance Range): the mask
+  selects a band of the photo's own tones, on a scale where `y = (EV over middle grey + 8) / 12`
+  (0 = 8 stops under grey, 0.67 = grey, 1 = 4 stops over). Contrast, Clarity or a Mask Curve on it
+  give that zone its own grade, as with a split-grade print:
+
+  | Zone | `lo` | `hi` | feathers |
+  |---|---|---|---|
+  | deep shadows (under −3 EV) | 0 | 0.42 | `hi_feather` 0.08 |
+  | shadows to lower mids (−5 … −1 EV) | 0.25 | 0.58 | 0.06 each |
+  | highlights (over +1 EV) | 0.75 | 1 | `lo_feather` 0.08 |
+
+  ```sh
+  # grade 5 in the shadows, grade 1 in the sky of the same photo
+  antpitphoto-cli run --library LIB mask.add '{"kind":"luminanceRange","lo":0,"hi":0.45,"hi_feather":0.08}' \
+      mask.adjust '{"values":{"contrast":60,"clarity":20}}' \
+      mask.add '{"kind":"luminanceRange","lo":0.75,"hi":1,"lo_feather":0.08}' \
+      mask.adjust '{"values":{"contrast":-40}}'
+  ```
 - **Faithful preview without exporting** — `develop.renderPreview {path, size?}`: the active photo
   through the export pipeline (every mask and matte at full quality) at `size` px on the long
   edge, unlike a screenshot taken while finer masks are still being computed.

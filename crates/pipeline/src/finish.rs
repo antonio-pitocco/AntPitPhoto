@@ -192,6 +192,48 @@ fn grain_noise(x: f32, y: f32, seed: u32) -> f32 {
     a + (b - a) * v
 }
 
+/// Bright Lights knee, in EV under the scene luminance the tone map prints at [`LIGHTS_WHITE`], and
+/// reach above the knee: at full strength every luminance above the knee is brought within
+/// `LIGHTS_RANGE` of it, under that white, so a light source in the frame prints as a bright,
+/// unclipped lamp whatever the photo's tone curve.
+pub const LIGHTS_BELOW_WHITE: f32 = 1.5;
+pub const LIGHTS_RANGE: f32 = 1.2;
+/// The display luminance Bright Lights measures the tone map's white from.
+pub const LIGHTS_WHITE: f32 = 0.97;
+
+/// The scene luminance (EV over grey) `tone` first prints at [`LIGHTS_WHITE`]; 10 EV when it never does.
+pub fn tone_white_ev(tone: &ToneMap) -> f32 {
+    (0..=800).map(|i| -6.0 + i as f32 * 0.02).find(|ev| tone.apply(crate::tone::GREY * ev.exp2()) >= LIGHTS_WHITE).unwrap_or(10.0)
+}
+
+/// The change (EV) Bright Lights at strength `k` (0..1) makes to log luminance `l` (EV over grey)
+/// above `knee`: none below it; above it the excess `x` becomes `x / (1 + k·x / LIGHTS_RANGE)`,
+/// smooth at the knee, monotone in `l`, and bounded by `LIGHTS_RANGE / k` however bright the source.
+pub fn compress_lights(l: f32, k: f32, knee: f32) -> f32 {
+    let x = l - knee;
+    if x <= 0.0 || k <= 0.0 {
+        return 0.0;
+    }
+    x / (1.0 + k * x / LIGHTS_RANGE) - x
+}
+
+/// Display level (linear) above which Bright Lights rolls off a lamp's brightest channel after the tone
+/// map, and the level it never exceeds at full strength (about 243 of 255 in sRGB).
+pub const LIGHTS_DISPLAY_KNEE: f32 = 0.7;
+pub const LIGHTS_DISPLAY_WHITE: f32 = 0.9;
+
+/// The brightest display channel `mx` of a pixel after Bright Lights at strength `k` (0..1): unchanged up
+/// to [`LIGHTS_DISPLAY_KNEE`], rolled off above it, and at full strength never above [`LIGHTS_DISPLAY_WHITE`] however far
+/// over white `mx` was.
+pub fn compress_display_lights(mx: f32, k: f32) -> f32 {
+    let x = mx - LIGHTS_DISPLAY_KNEE;
+    if x <= 0.0 || k <= 0.0 {
+        return mx;
+    }
+    let reach = LIGHTS_DISPLAY_WHITE - LIGHTS_DISPLAY_KNEE;
+    LIGHTS_DISPLAY_KNEE + x / (1.0 + k * x / reach)
+}
+
 /// Number of per-mask terms in [`mask_terms`].
 pub const MASK_TERMS: usize = 21;
 
@@ -482,6 +524,10 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
+    // Bright Lights of each mask (0..1), in the order of `p.masks` (CPU only, like the masks' curves)
+    let lights: Vec<f32> = p.masks.iter().map(|m| (m.adjust.lights / 100.0).clamp(0.0, 1.0) as f32).collect();
+    let any_lights = lights.iter().any(|v| *v > 0.0);
+    let lights_knee = if any_lights { tone_white_ev(tone) - LIGHTS_BELOW_WHITE } else { 0.0 };
     // the masks' curves, in the order of `p.masks` (only the ones that have a curve)
     let mask_curves: Vec<(usize, &[Lut1; 3])> =
         p.masks.iter().enumerate().filter_map(|(k, m)| fp.mask_curves.iter().find(|(id, _)| *id == m.id).map(|(_, l)| (k, l))).collect();
@@ -507,7 +553,8 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             // --- local (mask) contributions: alpha-weighted sums of the masks' terms
             let mut l = [0.0f32; MASK_SUMS];
             let mut tint_col: Option<([f32; 3], f32)> = None;
-            for (m, t) in p.masks.iter().zip(&terms) {
+            let mut l_lights = 0.0f32;
+            for ((m, t), lt) in p.masks.iter().zip(&terms).zip(&lights) {
                 let a = m.alpha.data[i];
                 if a <= 0.0 {
                     continue;
@@ -515,6 +562,7 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 for k in 0..MASK_SUMS {
                     l[k] += a * t[k];
                 }
+                l_lights += a * lt;
                 if t[MASK_SUMS] > 0.0 {
                     tint_col = Some(([t[MASK_SUMS + 1], t[MASK_SUMS + 2], 0.0], a * t[MASK_SUMS + 3]));
                 }
@@ -617,6 +665,10 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 let det = l_pre - b.data[i];
                 delta -= l_noise.clamp(-1.0, 1.0) * 0.9 * det * (1.0 - smooth(0.1, 0.5, det.abs()));
             }
+            // local Bright Lights: compress what lies above the knee, however far above white
+            if any_lights && l_lights > 0.0 {
+                delta += compress_lights(l1 + delta, l_lights.min(1.0), lights_knee);
+            }
             if delta != 0.0 {
                 let g = delta.exp2();
                 c = c.map(|v| v * g);
@@ -634,6 +686,17 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             let k = tone.chroma_scale(o);
             if k != 1.0 {
                 d = d.map(|v| o + (v - o) * k);
+            }
+            // local Bright Lights, second half: a coloured lamp (a red neon) still clips its brightest channel
+            // of the output after the tone map, which works on luminance; bring that channel under white,
+            // scaling the three alike so the lamp keeps its colour
+            if any_lights && l_lights > 0.0 {
+                let o3 = mul3(to_out, d);
+                let mx = o3[0].max(o3[1]).max(o3[2]);
+                let to = compress_display_lights(mx, l_lights.min(1.0));
+                if to < mx {
+                    d = d.map(|v| v * to / mx);
+                }
             }
             let mx = d[0].max(d[1]).max(d[2]);
             if mx > peak {

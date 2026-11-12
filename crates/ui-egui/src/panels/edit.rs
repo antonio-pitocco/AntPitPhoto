@@ -352,6 +352,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         {
             control(app, ui, d, c, true);
         }
+        // bands from a flickering light (LEDs, tubes) across a rolling-shutter frame
+        control(app, ui, d, "detail.deband", true);
         ui.add_space(8.0);
     });
     section(app, ui, &d, "optics", "Optics", |app, ui, d| {

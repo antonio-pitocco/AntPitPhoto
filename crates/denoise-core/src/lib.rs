@@ -13,4 +13,4 @@ pub mod run;
 pub mod tiles;
 
 pub use manifest::{DenoiserManifest, Domain, Gain, ManifestError};
-pub use run::{Control, Error, Params, TileRunner, denoise_bayer};
+pub use run::{Control, Error, Params, TileRunner, denoise_bayer, denoise_rgb};

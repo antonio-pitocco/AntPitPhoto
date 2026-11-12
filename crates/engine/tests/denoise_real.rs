@@ -4,11 +4,11 @@
 //!
 //! ```text
 //! LC_DENOISE_MODEL=<model_bayer.onnx> LC_DENOISE_RAW=<folder with raw files> \
-//!   cargo test --release -p lightcraft-engine --features denoise --test denoise_real -- --ignored --nocapture
+//!   [LC_DENOISE_MODEL_LINEAR=<model_linear.onnx>] cargo test --release -p lightcraft-engine --features denoise --test denoise_real -- --ignored --nocapture
 //! ```
 //!
 //! `LC_DENOISE_RAW` is a folder of CC0 raw files (`cargo xtask corpus --download` → `corpus/raw`); every file in it is
-//! tried. Optional: `LC_DENOISE_ONLY` (a file name to try alone), `LC_DENOISE_RUN_ON=cpu|gpu|auto` (where the model runs; `cpu` to compare with the card).
+//! tried. Optional: `LC_DENOISE_MODEL_LINEAR` (the linear model, so X-Trans files are denoised too), `LC_DENOISE_ONLY` (a file name to try alone), `LC_DENOISE_RUN_ON=cpu|gpu|auto` (where the model runs; `cpu` to compare with the card).
 #![cfg(feature = "denoise")]
 
 use std::path::{Path, PathBuf};
@@ -67,6 +67,14 @@ fn the_real_model_denoises_real_raws_through_the_engine() {
     let r = s.execute("denoise.models.install", &json!({"path": model.to_string_lossy(), "acknowledged": true})).unwrap();
     println!("installed {} in {:.1} s: self-test {}", r["installed"]["id"], t.elapsed().as_secs_f64(), r["installed"]["accepted"]["selfTest"]);
     assert_eq!(r["installed"]["id"], "rawnind-bayer");
+    // the linear model, for the raw files that are not Bayer: it goes beside the Bayer one
+    if let Some(linear) = std::env::var_os("LC_DENOISE_MODEL_LINEAR") {
+        let r = s.execute("denoise.models.install", &json!({"path": linear.to_string_lossy(), "acknowledged": true})).unwrap();
+        println!("installed {}: self-test {}", r["installed"]["id"], r["installed"]["accepted"]["selfTest"]);
+        assert_eq!(r["installed"]["id"], "rawnind-linear");
+        assert_eq!(r["installed"]["companion"], true, "{r}");
+        assert_eq!(r["model"], "rawnind-bayer", "the Bayer model stays the one in use");
+    }
     if let Ok(run_on) = std::env::var("LC_DENOISE_RUN_ON") {
         s.execute("denoise.settings", &json!({"runOn": run_on})).unwrap();
     }

@@ -107,3 +107,66 @@ fn local_defringe_desaturates_purple_edges_only() {
     let flat = |img: &Rgba8| sat(at(img, 70));
     assert!((flat(&on) - flat(&plain)).abs() <= 2.0, "flat purple kept: {} vs {}", flat(&on), flat(&plain));
 }
+
+/// A lamp many stops over white, in the mask and out of it: Bright Lights brings the one in the
+/// mask under white, where local Exposure alone (the photographer's −2.5 EV) leaves it clipped;
+/// what lies under the knee is untouched.
+#[test]
+fn local_bright_lights_bring_a_lamp_under_white() {
+    let lamp = |x: usize, y: usize| (y as isize - 60).abs() < 10 && ((x as isize - 50).abs() < 10 || (x as isize - 190).abs() < 10);
+    let src = Rgb32f::from_fn(W, H, |x, y| if lamp(x, y) { [0.18 * 2f32.powi(9); 3] } else { [0.05; 3] });
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let shot = |s: &DevelopSettings| render(&src, &info, s, &RenderRequest::fit(W, H)).image;
+    let at = |img: &Rgba8, x: usize, y: usize| luma(img.data[y * W + x]);
+    let exposure_only = shot(&left_mask(LocalAdjustments { exposure: -2.5, ..Default::default() }));
+    assert!(at(&exposure_only, 50, 60) > 250.0, "exposure alone keeps the lamp clipped: {}", at(&exposure_only, 50, 60));
+    let lights = shot(&left_mask(LocalAdjustments { exposure: -2.5, lights: 100.0, ..Default::default() }));
+    let (inside, outside) = (at(&lights, 50, 60), at(&lights, 190, 60));
+    assert!(inside < 235.0 && inside > 150.0, "the lamp in the mask prints bright but under white: {inside}");
+    assert!(outside > 250.0, "the lamp outside the mask is untouched: {outside}");
+    // the dark surround (under the knee) is the same as with exposure alone
+    assert_eq!(at(&lights, 20, 20), at(&exposure_only, 20, 20));
+}
+
+#[test]
+fn local_bright_lights_bring_a_coloured_lamp_under_white_with_its_colour() {
+    // a warm neon: the red channel far over white, the luminance much lower
+    let lamp = |x: usize, y: usize| (y as isize - 60).abs() < 10 && (x as isize - 50).abs() < 10;
+    let src = Rgb32f::from_fn(W, H, |x, y| if lamp(x, y) { [0.18 * 2f32.powi(8), 0.18 * 2f32.powi(5), 0.18 * 2f32.powi(4)] } else { [0.05; 3] });
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let shot = |s: &DevelopSettings| render(&src, &info, s, &RenderRequest::fit(W, H)).image;
+    let red = |img: &Rgba8| img.data[60 * W + 50][0];
+    let plain = shot(&left_mask(LocalAdjustments::default()));
+    assert!(red(&plain) >= 254, "the neon clips red: {}", red(&plain));
+    let lit = shot(&left_mask(LocalAdjustments { lights: 100.0, ..Default::default() }));
+    let px = lit.data[60 * W + 50];
+    assert!(px[0] < 246, "the neon's red comes under white: {px:?}");
+    assert!(px[0] > px[2] + 20, "and keeps its colour: {px:?}");
+}
+
+#[test]
+fn bright_lights_curve_is_smooth_monotone_and_bounded() {
+    use crate::finish::{LIGHTS_RANGE, compress_lights};
+    let knee = 1.0;
+    assert_eq!(compress_lights(knee - 0.5, 1.0, knee), 0.0);
+    assert_eq!(compress_lights(12.0, 0.0, knee), 0.0);
+    let mut prev = f32::NEG_INFINITY;
+    for i in 0..400 {
+        let l = knee + i as f32 * 0.05;
+        let out = l + compress_lights(l, 1.0, knee);
+        assert!(out >= prev && out <= knee + LIGHTS_RANGE + 1e-4, "{l} -> {out}");
+        prev = out;
+    }
+    // stronger compresses more
+    assert!(compress_lights(8.0, 1.0, knee) < compress_lights(8.0, 0.5, knee));
+    // after the tone map: untouched under the knee, under white at full strength however bright
+    use crate::finish::{LIGHTS_DISPLAY_KNEE, LIGHTS_DISPLAY_WHITE, compress_display_lights};
+    assert_eq!(compress_display_lights(LIGHTS_DISPLAY_KNEE - 0.1, 1.0), LIGHTS_DISPLAY_KNEE - 0.1);
+    let mut prev = 0.0;
+    for i in 0..400 {
+        let mx = LIGHTS_DISPLAY_KNEE + i as f32 * 0.02;
+        let out = compress_display_lights(mx, 1.0);
+        assert!(out >= prev && out <= LIGHTS_DISPLAY_WHITE, "{mx} -> {out}");
+        prev = out;
+    }
+}

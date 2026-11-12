@@ -27,6 +27,7 @@ pub mod auto;
 pub mod blemish;
 pub mod colorops;
 pub mod cull;
+pub mod deband;
 pub mod dust;
 pub mod finish;
 pub mod geometry;
@@ -377,6 +378,8 @@ pub struct Plan<'a> {
     pub keep: Option<PixelWindow>,
     /// The source's segmentation mattes ([`SourceInfo::mattes`]).
     pub mattes: Option<Arc<masks::Mattes>>,
+    /// LED banding found on the whole frame, when Detail ▸ LED Banding is on ([`deband`]).
+    pub bands: Option<Arc<deband::Bands>>,
 }
 
 /// Long edge of the small render a windowed render estimates the whole frame's airlight from.
@@ -405,6 +408,8 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let px_per_long = frame.px_per_long(full_w);
     let mut fixed_air = None;
     let mut keep = None;
+    // measured on the whole frame, so a window removes the same bands as the full render
+    let bands = (s.section_enabled("detail") && s.detail.deband > 0.0).then(|| deband::estimate(src, &frame, full_w, full_h)).flatten().map(Arc::new);
     let (frame, w, h) = match req.window {
         Some(win) => {
             let win = win.clamped(full_w, full_h);
@@ -437,22 +442,29 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         // and the local tone mapping
         local_tone::enabled(info, s),
         src_long,
+        // and the LED banding removal
+        format!("{bands:?}"),
+        s.detail.deband.to_bits(),
     ));
     let lin_key = hash_of((pre_nr_key, [d.nr_luminance, d.nr_detail, d.nr_color, d.nr_color_detail, d.nr_color_smoothness].map(f64::to_bits)));
-    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+    Plan { settings, frame, w, h, px_per_long, src_long, geo, lin_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone(), bands }
 }
 
 /// Whether the scene-linear stage needs work only the CPU does (defringe, spot removal).
 pub fn lin_needs_cpu(s: &DevelopSettings, info: &SourceInfo) -> bool {
     let o = &s.optics;
     let defringe = s.section_enabled("optics") && (o.defringe_purple_amount > 0.0 || o.defringe_green_amount > 0.0);
-    defringe || !s.spots.is_empty() || local_tone::enabled(info, s)
+    let deband = s.section_enabled("detail") && s.detail.deband > 0.0;
+    defringe || deband || !s.spots.is_empty() || local_tone::enabled(info, s)
 }
 
 /// The white-balanced, defringed, retouched image (before noise reduction): the CPU part of the
 /// scene-linear stage, in place.
 pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     let s = &*p.settings;
+    if let Some(b) = &p.bands {
+        deband::apply(img, &p.frame, b, (s.detail.deband / 100.0).clamp(0.0, 1.0) as f32);
+    }
     // (before the white balance: the gain's input is the as-shot development, as in the file)
     local_tone::apply(img, info, p);
     local::white_balance(img, info, s);

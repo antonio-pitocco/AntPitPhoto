@@ -661,6 +661,9 @@ pub struct Detail {
     pub nr_color: f64,
     pub nr_color_detail: f64,
     pub nr_color_smoothness: f64,
+    /// LED Banding (0..100): removes the bands a flickering light leaves across a rolling-shutter
+    /// frame (`lightcraft_pipeline::deband`).
+    pub deband: f64,
 }
 
 impl Default for Detail {
@@ -678,6 +681,7 @@ impl Default for Detail {
             nr_color: 0.0,
             nr_color_detail: 50.0,
             nr_color_smoothness: 50.0,
+            deband: 0.0,
         }
     }
 }
@@ -885,6 +889,10 @@ pub struct LocalAdjustments {
     /// Colour overlay (hue degrees, saturation 0..100); sat 0 = none.
     pub color_hue: f64,
     pub color_sat: f64,
+    /// Bright Lights (0..100): compresses the luminance above a knee inside the mask, so a lamp,
+    /// a neon tube or a window in the frame comes down under paper white instead of staying clipped
+    /// whatever the exposure (see `lightcraft_pipeline::finish::compress_lights`).
+    pub lights: f64,
     /// Local vignette/grain are not in Lightroom; we keep the struct extensible.
     pub amount: f64,
 }
@@ -911,6 +919,7 @@ impl Default for LocalAdjustments {
             defringe: 0.0,
             color_hue: 0.0,
             color_sat: 0.0,
+            lights: 0.0,
             amount: 100.0,
         }
     }

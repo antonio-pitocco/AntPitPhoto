@@ -461,6 +461,8 @@ pub fn try_render(
             || req.overlay == lightcraft_pipeline::Overlay::HdrRange
             // a curve inside a mask has no GPU stage (yet): CPU
             || s.masks.iter().any(|m| m.visible && !m.curve.is_identity())
+            // nor Bright Lights inside a mask
+            || s.masks.iter().any(|m| m.visible && m.adjust.lights > 0.0)
             // print toning neither
             || !s.toning.is_off()
         {

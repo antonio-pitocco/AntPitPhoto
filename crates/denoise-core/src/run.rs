@@ -354,6 +354,142 @@ fn blend_tile(
     }
 }
 
+/// Denoise the linear RGB picture `img` (white at 1) with a model on RGB tiles of `p.tile` pixels that gives RGB of the
+/// same size ([`crate::manifest::Domain::LinearRgb`]). The tiles are cut, scale-matched, protected where clipped and
+/// blended as [`denoise_bayer`] does with cells.
+pub fn denoise_rgb(img: &Rgb32f, runner: &dyn TileRunner, p: &Params, ctl: &Control<'_>) -> Result<Rgb32f, Error> {
+    let (width, height) = (img.width, img.height);
+    let pixels = width
+        .checked_mul(height)
+        .filter(|&n| n > 0 && n <= MAX_PIXELS)
+        .ok_or_else(|| Error::Input("the picture has no size, or is too large".into()))?;
+    if img.data.len() != pixels {
+        return Err(Error::Input("the picture does not have width × height pixels".into()));
+    }
+    if !(16..=2048).contains(&p.tile) || p.overlap >= p.tile.div_ceil(2) {
+        return Err(Error::Input("the tile size and overlap do not fit".into()));
+    }
+    if let Gain::MatchMean { nominal, max_deviation } = p.gain
+        && !(nominal.is_finite() && (1e-6..=1e12).contains(&nominal.abs()) && max_deviation.is_finite() && (0.0..=0.5).contains(&max_deviation))
+    {
+        return Err(Error::Input("the model gain is not finite or within its supported range".into()));
+    }
+    if p.clip.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+        return Err(Error::Input("the highlight clip must be finite and positive".into()));
+    }
+    let t = p.tile;
+    let (sx, sy) = (starts(width, t, p.overlap), starts(height, t, p.overlap));
+    let (cols, rows) = (sx.len(), sy.len());
+    if cols == 0 || rows == 0 {
+        return Err(Error::Input("the picture needs too many tiles".into()));
+    }
+    let tiles: Vec<(usize, usize, bool, bool, bool, bool)> = sy
+        .iter()
+        .enumerate()
+        .flat_map(|(j, &y0)| sx.iter().enumerate().map(move |(i, &x0)| (x0, y0, i > 0, i + 1 < cols, j > 0, j + 1 < rows)))
+        .collect();
+    let total = tiles.len();
+    let mut acc = allocate(pixels, [0f32; 3])?;
+    let mut wsum = allocate(pixels, 0f32)?;
+    let group = p.parallel.clamp(1, 4);
+    let mut done = 0;
+    for chunk in tiles.chunks(group) {
+        if ctl.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Cancelled);
+        }
+        let outs: Vec<Result<Vec<f32>, Error>> = chunk
+            .par_iter()
+            .map(|&(x0, y0, bx, ax, by, ay)| {
+                // three planes; a picture smaller than a tile is padded by mirroring
+                let mut input = allocate(3 * t * t, 0f32)?;
+                for j in 0..t {
+                    let y = crate::bayer::reflect((y0 + j) as isize, height);
+                    for i in 0..t {
+                        let x = crate::bayer::reflect((x0 + i) as isize, width);
+                        let px = img.data.get(y * width + x).copied().unwrap_or_default();
+                        for c in 0..3 {
+                            input[c * t * t + j * t + i] = px[c];
+                        }
+                    }
+                }
+                let mut out = runner.run(&input)?;
+                if out.len() != 3 * t * t {
+                    return Err(Error::Model(format!("{} numbers for a tile, not the {} expected", out.len(), 3 * t * t)));
+                }
+                if out.iter().any(|v| !v.is_finite()) {
+                    return Err(Error::Model("numbers that are not finite".into()));
+                }
+                finish_rgb_tile(&input, &mut out, p, (bx, ax, by, ay));
+                Ok(out)
+            })
+            .collect();
+        for (&(x0, y0, bx, ax, by, ay), r) in chunk.iter().zip(outs) {
+            let out = r?;
+            let wx: Vec<f32> = (0..t).map(|i| weight(i, t, p.overlap, bx, ax)).collect();
+            let wy: Vec<f32> = (0..t).map(|j| weight(j, t, p.overlap, by, ay)).collect();
+            for j in 0..t.min(height - y0) {
+                for i in 0..t.min(width - x0) {
+                    let w = wx[i] * wy[j];
+                    let k = (y0 + j) * width + x0 + i;
+                    wsum[k] += w;
+                    for c in 0..3 {
+                        acc[k][c] += w * out[c * t * t + j * t + i];
+                    }
+                }
+            }
+            done += 1;
+            if let Some(f) = ctl.progress {
+                f(done, total);
+            }
+        }
+    }
+    acc.par_iter_mut().zip(wsum.par_iter()).for_each(|(px, &w)| {
+        if w > 0.0 {
+            *px = px.map(|v| v / w);
+        }
+    });
+    Ok(Rgb32f { width, height, data: acc })
+}
+
+/// [`finish_tile`] for an RGB tile: bring each channel to the input's scale (with the sign of the model's), and keep the
+/// input where any channel is at or near white.
+fn finish_rgb_tile(input: &[f32], out: &mut [f32], p: &Params, edges: (bool, bool, bool, bool)) {
+    let t = p.tile;
+    let plane = t * t;
+    if let Gain::MatchMean { nominal, max_deviation } = p.gain {
+        let m = p.overlap / 2;
+        let (i0, i1) = (if edges.0 { m } else { 0 }, t - if edges.1 { m } else { 0 });
+        let (j0, j1) = (if edges.2 { m } else { 0 }, t - if edges.3 { m } else { 0 });
+        let mean = |v: &[f32], c: usize| -> f64 {
+            let s: f64 = (j0..j1).map(|j| v[c * plane + j * t + i0..c * plane + j * t + i1].iter().map(|&x| f64::from(x)).sum::<f64>()).sum();
+            s / ((i1 - i0) * (j1 - j0)) as f64
+        };
+        for c in 0..3 {
+            let (mi, mo) = (mean(input, c), mean(out, c));
+            let measured = if mi as f32 >= MIN_SIGNAL && (mo / mi) as f32 * nominal.signum() > 0.0 { (mo / mi) as f32 } else { nominal };
+            let (lo, hi) = (nominal.abs() * (1.0 - max_deviation), nominal.abs() * (1.0 + max_deviation));
+            let g = measured.abs().clamp(lo, hi) * nominal.signum();
+            if g.is_finite() && g != 0.0 {
+                out[c * plane..(c + 1) * plane].iter_mut().for_each(|v| *v /= g);
+            }
+        }
+    }
+    if let Some(clip) = p.clip {
+        let lo = clip - 0.03;
+        for k in 0..plane {
+            let mx = input[k].max(input[plane + k]).max(input[2 * plane + k]);
+            let s = ((mx - lo) / (clip - lo)).clamp(0.0, 1.0);
+            if s > 0.0 {
+                let s = s * s * (3.0 - 2.0 * s);
+                for c in 0..3 {
+                    let v = &mut out[c * plane + k];
+                    *v += (input[c * plane + k] - *v) * s;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +518,36 @@ mod tests {
             }
             Ok(out)
         }
+    }
+
+    /// A stand-in RGB model: the tile back, times `scale` (negative: inverted, like the real linear model).
+    struct MockRgb {
+        scale: f32,
+    }
+    impl TileRunner for MockRgb {
+        fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
+            Ok(input.iter().map(|v| v * self.scale).collect())
+        }
+    }
+
+    #[test]
+    fn an_rgb_picture_comes_back_through_inverted_scaled_tiles() {
+        let (w, h) = (150usize, 97usize);
+        let img = Rgb32f::from_fn(w, h, |x, y| {
+            let s = 0.6 + 0.4 * ((x as f32 / 23.0).sin() * (y as f32 / 31.0).cos());
+            [0.5 * s, 0.3 * s, 0.2 * s]
+        });
+        for nominal in [-3.0e9f32, 2.0] {
+            let gain = Gain::MatchMean { nominal, max_deviation: 0.1 };
+            let p = Params { tile: 64, overlap: 16, gain, clip: Some(0.98), parallel: 2 };
+            let out = denoise_rgb(&img, &MockRgb { scale: nominal * 1.05 }, &p, &Control::default()).unwrap();
+            let worst = img.data.iter().zip(&out.data).flat_map(|(a, b)| (0..3).map(move |c| (a[c] - b[c]).abs())).fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "{nominal}: {worst}");
+        }
+        // a picture smaller than a tile is mirrored into it
+        let small = Rgb32f::from_fn(20, 10, |x, _| [0.1 + x as f32 * 0.01; 3]);
+        let p = Params { tile: 64, overlap: 16, gain: Gain::None, clip: None, parallel: 1 };
+        assert_eq!(denoise_rgb(&small, &MockRgb { scale: 1.0 }, &p, &Control::default()).unwrap().data, small.data);
     }
 
     fn params(tile: usize, overlap: usize, gain: Gain) -> Params {

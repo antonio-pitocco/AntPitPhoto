@@ -509,6 +509,7 @@ fn files_that_cannot_be_denoised_fail_with_a_reason_and_never_a_panic() {
         manifest: manifest("stand-in"),
         onnx: dir.join("model.onnx"),
         model: Default::default(),
+        rgb: None,
         loader: dim_loader(&Arc::new(AtomicUsize::new(0))),
         parallel: 2,
         run_on: RunOn::Auto,
@@ -579,6 +580,7 @@ fn two_threads_making_the_same_picture_make_it_once() {
         manifest: manifest("stand-in"),
         onnx: dir.join("model.onnx"),
         model: Default::default(),
+        rgb: None,
         loader: dim_loader(&runs),
         parallel: 2,
         run_on: RunOn::Auto,
@@ -857,4 +859,96 @@ fn denoise_row_while_queue_is_busy() {
     assert!(shown, "the photo never showed a row");
     assert!(rows(&x.s).is_empty(), "the row goes once the photo is made");
     let _ = std::fs::remove_dir_all(&x.dir);
+}
+
+/// A stand-in linear-RGB model: the tile back, inverted and scaled like the real one.
+struct Echo;
+
+impl TileRunner for Echo {
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, lightcraft_denoise::Error> {
+        Ok(input.iter().map(|v| v * -2.0e9).collect())
+    }
+}
+
+impl Model for Echo {
+    fn runner(&self, _: RunOn, threads: usize) -> (&dyn TileRunner, usize) {
+        (self, threads)
+    }
+
+    fn self_test(&self, _: RunOn) -> Result<Value, String> {
+        Ok(json!({"ok": true}))
+    }
+}
+
+#[test]
+fn an_x_trans_raw_is_demosaiced_and_denoised_by_the_linear_model() {
+    use crate::denoise::{MakeError, make_product};
+    use lightcraft_raw::*;
+    let dir = temp_dir("xtrans");
+    let (w, h) = (192usize, 162usize);
+    let raw = RawImage {
+        format: RawFormat::Dng,
+        width: w,
+        height: h,
+        cpp: 1,
+        data: RawData::U16((0..w * h).map(|i| 600 + ((i % w) * 30 + (i / w) * 35) as u16).collect()),
+        cfa: Some(Cfa::xtrans()),
+        bits: 14,
+        black: BlackLevel::uniform(256.0),
+        white: vec![16000.0],
+        active_area: Rect::new(0, 0, w, h),
+        crop: Rect::new(0, 0, w, h),
+        orientation: Orientation::Normal,
+        color: ColorData {
+            illuminant: [17, 21],
+            color_matrix: [
+                Some(lightcraft_color::Mat3([[0.9, 0.2, -0.15], [-0.3, 1.25, 0.08], [0.02, -0.12, 0.85]])),
+                Some(lightcraft_color::Mat3([[0.7, 0.3, -0.1], [-0.35, 1.3, 0.1], [0.05, -0.2, 1.0]])),
+            ],
+            as_shot_neutral: Some([0.5, 1.0, 0.7]),
+            ..Default::default()
+        },
+        wb_multipliers: None,
+        linearized: false,
+        opcodes: OpcodeLists::default(),
+        metadata: Default::default(),
+    };
+    let f = dir.join("x.dng");
+    std::fs::write(&f, write_dng(&raw, &DngWriteOptions::default()).unwrap()).unwrap();
+    let linear = DenoiserManifest {
+        id: "linear".into(),
+        domain: Domain::LinearRgb,
+        gain: Gain::MatchMean { nominal: -2.0e9, max_deviation: 0.1 },
+        ..manifest("linear")
+    };
+    let loader: Loader = Arc::new(|_, m: &DenoiserManifest| {
+        Ok(if m.domain == Domain::LinearRgb {
+            Arc::new(Echo) as Arc<dyn Model>
+        } else {
+            Arc::new(Dim { runs: Default::default() }) as Arc<dyn Model>
+        })
+    });
+    let spec = |rgb: bool| crate::denoise::JobSpec {
+        path: f.to_string_lossy().into_owned(),
+        read: None,
+        product: dir.join(if rgb { "x.lcdn" } else { "none.lcdn" }),
+        key: "k".into(),
+        manifest: manifest("bayer"),
+        onnx: dir.join("model.onnx"),
+        model: Default::default(),
+        rgb: rgb.then(|| (linear.clone(), dir.join("linear.onnx"), Default::default())),
+        loader: loader.clone(),
+        parallel: 2,
+        run_on: RunOn::Auto,
+    };
+    // without the linear model the file says why
+    assert!(matches!(make_product(&spec(false), None), Err(MakeError::Unsupported(why)) if why.contains("X-Trans")));
+    assert_eq!(make_product(&spec(true), None), Ok(true));
+    // the stand-in changes nothing: the product is the plain demosaic of the mosaic, through Rec.2020 and back
+    let decoded = lightcraft_raw::decode(&std::fs::read(&f).unwrap()).unwrap();
+    let plain = demosaic(&decoded.normalized().unwrap(), Method::Ahd);
+    let made = lightcraft_denoise::product::read(&dir.join("x.lcdn"), "k", 1).unwrap();
+    assert_eq!((made.width, made.height), (plain.width, plain.height));
+    let worst = plain.data.iter().zip(&made.data).flat_map(|(a, b)| (0..3).map(move |c| (a[c] - b[c]).abs())).fold(0.0f32, f32::max);
+    assert!(worst < 2e-3, "{worst}");
 }

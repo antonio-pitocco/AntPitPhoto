@@ -187,11 +187,21 @@ impl Net {
         self.shapes.iter().map(|s| s.level.max(0) as u32).max().unwrap_or(0)
     }
 
-    /// Can the network run on a `tile × tile` input and give `[out_channels, 2·tile, 2·tile]`? (Pooling must divide
-    /// the tile, and the output must be one level above the input.)
+    /// Can the network run on a `tile × tile` input and give `[out_channels, k·tile, k·tile]` with `k` its
+    /// [`Net::out_factor`]? (Pooling must divide the tile, and the output must be at the input's level or one above.)
     pub fn fits_tile(&self, tile: usize) -> bool {
         let Some(multiple) = 1usize.checked_shl(self.depth()) else { return false };
-        tile > 0 && tile.is_multiple_of(multiple) && self.shapes.last().is_some_and(|s| s.level == -1)
+        tile > 0 && tile.is_multiple_of(multiple) && self.out_factor().is_some()
+    }
+
+    /// How many times larger the output's side is than the input's: 2 for a mosaic-to-RGB network (one level
+    /// above the input), 1 for an RGB-to-RGB one; `None` for any other output.
+    pub fn out_factor(&self) -> Option<usize> {
+        match self.shapes.last().map(|s| s.level) {
+            Some(-1) => Some(2),
+            Some(0) => Some(1),
+            _ => None,
+        }
     }
 
     /// Multiply-adds for one tile, for estimating time.
@@ -338,8 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn a_network_that_does_not_end_one_level_up_does_not_fit_a_tile() {
+    fn a_network_that_ends_neither_at_its_input_level_nor_one_up_does_not_fit_a_tile() {
+        let full = Net::new(4, unet()).unwrap();
+        assert_eq!(full.out_factor(), Some(2));
         let net = Net::new(4, unet()[..6].to_vec()).unwrap();
-        assert!(!net.fits_tile(64), "no depth-to-space: the output is not at twice the resolution");
+        assert!(net.out_factor() != Some(2), "no depth-to-space: the output is not at twice the resolution");
+        // stopped inside the U (below the input's level): no tile fits
+        let deep = (1..unet().len()).map(|n| Net::new(4, unet()[..n].to_vec())).filter_map(Result::ok).find(|n| n.out_factor().is_none());
+        if let Some(d) = deep {
+            assert!(!d.fits_tile(64));
+        }
     }
 }

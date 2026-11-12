@@ -13,7 +13,7 @@ use lightcraft_catalog::PhotoId;
 use lightcraft_denoise::archive;
 use lightcraft_denoise::hash::sha256_file;
 use lightcraft_denoise::known::{self, Known};
-use lightcraft_denoise::manifest::{self, DenoiserManifest, MAX_MANIFEST_BYTES, MAX_MODEL_BYTES};
+use lightcraft_denoise::manifest::{self, DenoiserManifest, Domain, MAX_MANIFEST_BYTES, MAX_MODEL_BYTES};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, bad, bool_or, cmd, str_param};
@@ -104,8 +104,16 @@ fn identify(path: &Path, c: &str, sha_known: Option<&str>) -> Result<Source> {
         None => sha256_file(path).map_err(|e| fail(&format!("could not read {}", path.display()), e))?,
     };
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // an archive LightCraft knows (the file darktable publishes the model in)
-    if let Some(k) = known::all().into_iter().find(|k| k.download.as_ref().is_some_and(|d| d.sha256 == sha256)) {
+    // an archive LightCraft knows (the file darktable publishes the model in); one archive may hold several models
+    // (RawNIND's Bayer and linear ones): a download is kept under its own model's name, a file the user brings gives
+    // the first
+    let from_archive: Vec<Known> = known::all().into_iter().filter(|k| k.download.as_ref().is_some_and(|d| d.sha256 == sha256)).collect();
+    if let Some(k) = from_archive
+        .iter()
+        .position(|k| k.download.as_ref().is_some_and(|d| d.file_name == file_name))
+        .or((!from_archive.is_empty()).then_some(0))
+        .and_then(|i| from_archive.into_iter().nth(i))
+    {
         return Ok(Source { manifest: k.manifest, entry: k.entry, file_name });
     }
     // the `.onnx` of a known model
@@ -229,19 +237,29 @@ fn activate_install(s: &mut Session, result: &Value, model: Arc<dyn crate::denoi
     let dir = models_dir(s, "denoise.models.install")?;
     let id = result["installed"]["id"].as_str().ok_or_else(|| bad("denoise.models.install", "missing installed id"))?;
     let mut st = read_settings(&dir);
-    if activate {
+    // a linear-RGB model installed beside the Bayer model in use goes with it (for the raw files that are not Bayer)
+    // instead of replacing it
+    let beside = {
+        let models = installed_models(&dir);
+        let domain = |i: &str| models.iter().find(|m| m.manifest.id == i).map(|m| m.manifest.domain);
+        domain(id) == Some(Domain::LinearRgb) && st.model.as_deref().and_then(domain) == Some(Domain::BayerToRgb)
+    };
+    if activate && !beside {
         st.model = Some(id.to_string());
         write_settings(&dir, &st).map_err(EngineError::Other)?;
     }
     s.denoise.touch();
     s.denoise_refresh_active(true);
-    if let Some(a) = &s.denoise.active
-        && a.id == id
-    {
-        *a.model.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
+    if let Some(a) = &s.denoise.active {
+        if a.id == id {
+            *a.model.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
+        } else if let Some(c) = a.companion.as_ref().filter(|c| c.manifest.id == id) {
+            *c.model.lock().unwrap_or_else(PoisonError::into_inner) = Some(model);
+        }
     }
     let mut v = result.clone();
     v["installed"]["selected"] = json!(st.model.as_deref() == Some(id));
+    v["installed"]["companion"] = json!(beside);
     v["model"] = json!(st.model);
     Ok(v)
 }

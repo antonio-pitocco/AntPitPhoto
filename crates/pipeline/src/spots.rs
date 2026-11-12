@@ -248,14 +248,16 @@ const FILL_STRUCTURE_EXTENT: usize = 256;
 
 fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize) {
     let hole: Vec<bool> = alpha.iter().map(|a| *a > 0.0).collect();
-    let flat: Vec<f32> = tgt.iter().flatten().copied().collect();
+    // patches are compared in a perceptual (square-root) encoding: in linear light every dark patch
+    // looks alike and the noise of the light ones decides the match
+    let flat: Vec<f32> = tgt.iter().flatten().map(|v| v.max(0.0).sqrt()).collect();
     // seeded in structure order, so a pole or cable crossing the spot is continued, not cut
     let params = lightcraft_inpaint::CompleteParams { structure_extent: FILL_STRUCTURE_EXTENT, ..Default::default() };
     let out =
         lightcraft_inpaint::complete(bw, bh, 3, &flat, &hole, &params).unwrap_or_else(|| lightcraft_inpaint::membrane_fill(bw, bh, 3, &flat, &hole));
     let (pixels, _) = out.as_chunks::<3>();
     for (d, v) in src.iter_mut().zip(pixels) {
-        *d = *v;
+        *d = v.map(|e| e * e);
     }
 }
 

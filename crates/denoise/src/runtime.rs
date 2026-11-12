@@ -39,6 +39,13 @@ impl CpuRunner {
         crate::manifest::validate(manifest).map_err(|e| Error::Load(e.to_string()))?;
         let started = Instant::now();
         let net = crate::onnx::read(path).map_err(|e| Error::Load(e.to_string()))?;
+        let fits = match manifest.domain {
+            crate::manifest::Domain::BayerToRgb => (net.in_channels, net.out_factor()) == (4, Some(2)),
+            crate::manifest::Domain::LinearRgb => (net.in_channels, net.out_factor()) == (3, Some(1)),
+        };
+        if !fits {
+            return Err(Error::Load("the model file does not take and give what its description says".into()));
+        }
         let runner = crate::cpu::NetRunner::new(&net, manifest.tile as usize).map_err(|e| Error::Load(e.to_string()))?;
         Ok(Self { runner, manifest: manifest.clone(), load_ms: started.elapsed().as_secs_f64() * 1e3 })
     }
@@ -63,7 +70,12 @@ impl TileRunner for CpuRunner {
 fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64) -> SelfTest {
     let t = manifest.tile as usize;
     let mut checks: Vec<(String, bool)> = Vec::new();
-    let (input, base) = test_tile(t);
+    let (mut input, base) = test_tile(t);
+    // an RGB model takes three planes of pixels and gives them back at the same size
+    let rgb = manifest.domain == crate::manifest::Domain::LinearRgb;
+    if rgb {
+        input.truncate(3 * t * t);
+    }
     let (mut times, mut scale) = (Vec::new(), 0.0f64);
     let mut run = || {
         let started = Instant::now();
@@ -79,7 +91,7 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
                 "gives the same answer for the same tile".into(),
                 a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4 * x.abs().max(y.abs()).max(1e-9)),
             ));
-            let side = 2 * t;
+            let side = if rgb { t } else { 2 * t };
             let mean_in = base.iter().map(|&v| f64::from(v)).sum::<f64>() / base.len().max(1) as f64;
             let mean_out = a.iter().map(|&v| f64::from(v)).sum::<f64>() / a.len().max(1) as f64;
             scale = if mean_in > 0.0 { mean_out / mean_in } else { 0.0 };
@@ -89,7 +101,7 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
                 checks.push((format!("its scale is the {nominal:.3e} the description says (found {scale:.3e})"), (ratio - 1.0).abs() <= tolerance));
             }
             // noise left after bringing the answer back to the input's scale, against the noise that went in
-            let g = if scale > 0.0 { 1.0 / scale } else { 1.0 };
+            let g = if scale != 0.0 && scale.is_finite() { 1.0 / scale } else { 1.0 };
             let (mut noise_in, mut noise_out, mut n_in, mut n_out) = (0.0f64, 0.0f64, 0usize, 0usize);
             for (i, (&v, &s)) in input.iter().zip(base.iter().cycle()).enumerate() {
                 // centre of each plane only: edges are the model's guess
@@ -102,7 +114,8 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
             for c in 0..3 {
                 for y in side / 4..3 * side / 4 {
                     for x in side / 4..3 * side / 4 {
-                        if let (Some(&o), Some(&s)) = (a.get(c * side * side + y * side + x), base.get((y / 2) * t + x / 2)) {
+                        let at = if rgb { y * t + x } else { (y / 2) * t + x / 2 };
+                        if let (Some(&o), Some(&s)) = (a.get(c * side * side + y * side + x), base.get(at)) {
                             noise_out += (f64::from(o) * g - f64::from(s)).powi(2);
                             n_out += 1;
                         }
@@ -119,7 +132,7 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
         ok: !checks.is_empty() && checks.iter().all(|(_, ok)| *ok),
         load_ms,
         tile_ms: times.get(times.len() / 2).copied().unwrap_or(0.0),
-        tile_megapixels: (2 * t * 2 * t) as f64 / 1e6,
+        tile_megapixels: if rgb { (t * t) as f64 / 1e6 } else { (2 * t * 2 * t) as f64 / 1e6 },
         scale,
         checks,
     }

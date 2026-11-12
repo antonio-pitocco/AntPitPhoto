@@ -48,6 +48,9 @@ pub fn exemplar_fill(
     if sources.is_empty() {
         return Ok(None);
     }
+    // the shifts under which the known picture repeats (a stripe's period, a pole's own direction):
+    // copies along them keep regular structures in step where fronts meet
+    let shifts = dominant_offsets(w, h, ch, img, hole, 2 * r + 2);
     let mut conf: Vec<f32> = filled.iter().map(|f| if *f { 1.0 } else { 0.0 }).collect();
     // where each filled hole pixel was copied from (as a patch-centre offset), so neighbours can
     // keep copying the same region: coherent copies continue a structure instead of stitching
@@ -115,6 +118,15 @@ pub fn exemplar_fill(
         let Some((_, tx, ty)) = best else { break };
         let coherent: Vec<(usize, usize)> = {
             let mut v: Vec<(usize, usize)> = Vec::new();
+            for &(ox, oy) in &shifts {
+                let (cx, cy) = (tx as isize + ox, ty as isize + oy);
+                if cx >= r as isize && cy >= r as isize && (cx as usize) < w - r && (cy as usize) < h - r {
+                    let c = (cx as usize, cy as usize);
+                    if holes_in(c.0 - r, c.1 - r, c.0 + r + 1, c.1 + r + 1) == 0 {
+                        v.push(c);
+                    }
+                }
+            }
             let (x0, y0, x1, y1) = (tx.saturating_sub(r), ty.saturating_sub(r), (tx + r + 1).min(w), (ty + r + 1).min(h));
             for yy in y0..y1 {
                 for xx in x0..x1 {
@@ -170,9 +182,8 @@ pub fn exemplar_fill(
 }
 
 /// The source patch centre most similar to the target patch at `(tx, ty)` over its filled pixels
-/// (sum of squared differences, each candidate abandoned once it can't win).
-/// A copy that continues a neighbour's (`coherent`) wins unless another source matches clearly
-/// better (by [`COHERENCE`]).
+/// (sum of squared differences, each candidate abandoned once it can't win), among the `coherent`
+/// ones (along a dominant shift, or continuing a neighbour's copy) when there are any.
 #[allow(clippy::too_many_arguments)]
 fn best_source(
     w: usize,
@@ -236,17 +247,110 @@ fn best_source(
         }
         search(cands)
     };
-    let any = global(sources);
-    if coherent.is_empty() {
-        return any.1;
-    }
-    let near = search(coherent);
-    if any.0 * COHERENCE < near.0 { any.1 } else { near.1 }
+    // a copy along a dominant shift or continuing a neighbour's always wins: the best match anywhere
+    // else is, on a noisy picture, mostly the luckiest noise (a stripe's flat white copied from a
+    // label, a pole's stump into the sea); it is looked for only when no such copy is possible
+    if coherent.is_empty() { global(sources).1 } else { search(coherent).1 }
 }
 
-/// How much better (factor on the squared difference) a source must match than one continuing a
-/// neighbour's copy to be taken instead.
-const COHERENCE: f32 = 1.5;
+/// Dominant shifts kept by [`dominant_offsets`].
+const SHIFTS: usize = 16;
+/// Kept shifts differ by more than this (px, along either axis).
+const SHIFT_SEPARATION: isize = 3;
+/// Known pixels sampled to score a shift.
+const SHIFT_SAMPLES: usize = 2048;
+
+/// The shifts `(dx, dy)` (at least `min_shift` long) under which the known part of the picture
+/// best matches itself: the lowest local minima of the mean squared difference between a pixel and
+/// the pixel one shift away, over a fixed sample of known pixels whose shifted partner is known too.
+/// A regular structure (stripes, a fence, tiles) shows its period; a straight pole or cable, its own
+/// direction. (After K. He, J. Sun, *Statistics of Patch Offsets for Image Completion*, ECCV 2012,
+/// with the offsets scored directly instead of from patch matches.)
+pub fn dominant_offsets(w: usize, h: usize, ch: usize, img: &[f32], hole: &[bool], min_shift: usize) -> Vec<(isize, isize)> {
+    if ch == 0 || hole.len() != w * h || img.len() != hole.len() * ch {
+        return Vec::new();
+    }
+    // the hole's surroundings decide: known pixels within half the hole's extent of its bounding box
+    let (mut bx0, mut by0, mut bx1, mut by1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for (i, _) in hole.iter().enumerate().filter(|(_, b)| **b) {
+        let (x, y) = (i % w, i / w);
+        (bx0, by0, bx1, by1) = (bx0.min(x), by0.min(y), bx1.max(x), by1.max(y));
+    }
+    if bx0 > bx1 {
+        return Vec::new();
+    }
+    let reach = ((bx1 - bx0).max(by1 - by0) / 2).max(16);
+    let near = |x: usize, y: usize| x + reach >= bx0 && x <= bx1 + reach && y + reach >= by0 && y <= by1 + reach;
+    let known: Vec<usize> = (0..w * h).filter(|i| !hole[*i] && near(i % w, i / w)).collect();
+    if known.len() < 64 {
+        return Vec::new();
+    }
+    let step = (known.len() / SHIFT_SAMPLES).max(1);
+    let sample: Vec<(isize, isize)> = known.iter().step_by(step).map(|i| ((i % w) as isize, (i / w) as isize)).collect();
+    let lum = |x: isize, y: isize| {
+        let i = (y as usize * w + x as usize) * ch;
+        img[i..i + ch].iter().sum::<f32>() / ch as f32
+    };
+    let (mx, my) = ((w / 2) as isize, (h / 2) as isize);
+    let (gw, gh) = (2 * mx as usize + 1, 2 * my as usize + 1);
+    // the mean squared difference for every shift (NaN: too few pairs to tell)
+    let row = |dy: isize| -> Vec<f32> {
+        (-mx..=mx)
+            .map(|dx| {
+                let (mut e, mut n) = (0.0f32, 0usize);
+                for &(x, y) in &sample {
+                    let (sx, sy) = (x + dx, y + dy);
+                    if sx < 0 || sy < 0 || sx >= w as isize || sy >= h as isize || hole[sy as usize * w + sx as usize] {
+                        continue;
+                    }
+                    let d = lum(x, y) - lum(sx, sy);
+                    e += d * d;
+                    n += 1;
+                }
+                if n * 8 >= sample.len() { e / n as f32 } else { f32::NAN }
+            })
+            .collect()
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let cost: Vec<f32> = {
+        use rayon::prelude::*;
+        (-my..=my).into_par_iter().flat_map_iter(row).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let cost: Vec<f32> = (-my..=my).flat_map(row).collect();
+    let at = |gx: usize, gy: usize| cost[gy * gw + gx];
+    let mut minima: Vec<(f32, isize, isize)> = Vec::new();
+    for gy in 1..gh.saturating_sub(1) {
+        for gx in 1..gw.saturating_sub(1) {
+            let c = at(gx, gy);
+            let (dx, dy) = (gx as isize - mx, gy as isize - my);
+            if c.is_nan() || ((dx * dx + dy * dy) as f32).sqrt() < min_shift as f32 {
+                continue;
+            }
+            let is_min = (-1..=1isize).all(|j| {
+                (-1..=1isize).all(|i| {
+                    let v = at((gx as isize + i) as usize, (gy as isize + j) as usize);
+                    (i == 0 && j == 0) || v.is_nan() || c <= v
+                })
+            });
+            if is_min {
+                minima.push((c, dx, dy));
+            }
+        }
+    }
+    minima.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+    // one shift per neighbourhood: noise makes shallow minima next to a true one
+    let mut kept: Vec<(isize, isize)> = Vec::new();
+    for (_, dx, dy) in minima {
+        if kept.iter().all(|&(kx, ky)| (kx - dx).abs().max((ky - dy).abs()) > SHIFT_SEPARATION) {
+            kept.push((dx, dy));
+            if kept.len() == SHIFTS {
+                break;
+            }
+        }
+    }
+    kept
+}
 
 fn neighbours4(w: usize, h: usize, x: usize, y: usize) -> impl Iterator<Item = usize> {
     [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
@@ -291,6 +395,28 @@ mod tests {
         assert!(err < 0.02, "mean error in the hole {err}");
         // the pole's pixels in the middle of the hole are dark
         assert!(out[40 * w + 39] < 0.2 && out[40 * w + 40] < 0.2, "{} {}", out[40 * w + 39], out[40 * w + 40]);
+    }
+
+    /// Vertical stripes (period 13) with a round hole over several of them: the stripes run on
+    /// through the hole in step, without the dark bridges where the fronts meet.
+    #[test]
+    fn stripes_crossing_the_hole_stay_in_step() {
+        let (w, h) = (120usize, 120usize);
+        let stripe = |x: usize| if (x % 13) < 6 { 0.15 } else { 0.8 };
+        let img: Vec<f32> = (0..w * h).map(|i| stripe(i % w)).collect();
+        let hole: Vec<bool> = (0..w * h).map(|i| ((i % w) as f32 - 60.0).hypot((i / w) as f32 - 60.0) < 22.0).collect();
+        let mut damaged = img.clone();
+        for (v, hl) in damaged.iter_mut().zip(&hole) {
+            if *hl {
+                *v = 0.5;
+            }
+        }
+        // every dominant shift repeats the stripes exactly (a whole number of periods across)
+        let shifts = dominant_offsets(w, h, 1, &damaged, &hole, 8);
+        assert!(!shifts.is_empty() && shifts.iter().all(|(dx, _)| dx % 13 == 0), "{shifts:?}");
+        let out = exemplar_fill(w, h, 1, &damaged, &hole, 3, &|| false).unwrap().unwrap();
+        let bad = out.iter().zip(&img).zip(&hole).filter(|((a, b), hl)| **hl && (*a - *b).abs() > 0.1).count();
+        assert!(bad == 0, "{bad} pixels of the hole off the stripes");
     }
 
     #[test]

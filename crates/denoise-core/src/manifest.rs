@@ -21,6 +21,9 @@ pub enum Domain {
     /// `[R, G1, G2, B]` of its 2 × 2 cells, forced to RGGB; gives camera RGB at the mosaic's resolution, so
     /// the picture is denoised and demosaiced in one step and must not be demosaiced again.
     BayerToRgb,
+    /// Linear Rec.2020 RGB, white balanced (an already demosaiced picture: an X-Trans raw after demosaicing, white at 1),
+    /// three planes `[R, G, B]`; gives the same at the same size. Used for raw files that are not Bayer.
+    LinearRgb,
 }
 
 /// How the model's output scale is brought back to the input's.
@@ -30,7 +33,8 @@ pub enum Gain {
     /// The output already has the input's scale.
     None,
     /// The output has a scale of its own, `nominal` times the input's (a million, for one model) and a little
-    /// different from tile to tile: each tile is scaled so that its channel means equal the input's. A tile too
+    /// different from tile to tile (negative when the answer comes out inverted): each tile is scaled so that its
+    /// channel means equal the input's. A tile too
     /// dark to measure, or whose measured scale is further than `maxDeviation` (a fraction, 0.05 = 5 %) from
     /// `nominal`, is scaled as if it were within that limit.
     MatchMean { nominal: f32, max_deviation: f32 },
@@ -128,8 +132,9 @@ pub fn validate(m: &DenoiserManifest) -> Result<(), ManifestError> {
         return bad("overlap", "must be even, at least 16 and less than half the tile");
     }
     if let Gain::MatchMean { nominal, max_deviation } = m.gain {
-        if !(nominal.is_finite() && (1e-6..=1e12).contains(&nominal)) {
-            return bad("gain.nominal", "must be between 0.000001 and 1000000000000");
+        // (negative for a model whose answer comes out inverted: the scale is matched with its sign)
+        if !(nominal.is_finite() && (1e-6..=1e12).contains(&nominal.abs())) {
+            return bad("gain.nominal", "must be between 0.000001 and 1000000000000 in size");
         }
         if !(max_deviation.is_finite() && (0.0..=0.5).contains(&max_deviation)) {
             return bad("gain.maxDeviation", "must be between 0 and 0.5");

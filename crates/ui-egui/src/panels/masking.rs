@@ -35,6 +35,7 @@ pub const LOCAL: &[ControlSpec] = &[
     spec("noise", "Noise", -100.0, 100.0, 1.0, 0, Track::Centered),
     spec("moire", "Moiré", -100.0, 100.0, 1.0, 0, Track::Centered),
     spec("defringe", "Defringe", -100.0, 100.0, 1.0, 0, Track::Centered),
+    spec("lights", "Bright Lights", 0.0, 100.0, 1.0, 0, Track::Gradient { from: "#f4f4f4", to: "#8a8a8a" }),
 ];
 
 pub fn local_get(a: &LocalAdjustments, key: &str) -> f64 {

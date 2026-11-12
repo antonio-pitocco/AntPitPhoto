@@ -23,8 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use lightcraft_catalog::{Photo, PhotoId, Source};
 use lightcraft_denoise::bayer::Layout;
-use lightcraft_denoise::manifest::DenoiserManifest;
-use lightcraft_denoise::run::{Control, Params, TileRunner, denoise_bayer};
+use lightcraft_denoise::manifest::{DenoiserManifest, Domain};
+use lightcraft_denoise::run::{Control, Params, TileRunner, denoise_bayer, denoise_rgb};
 use lightcraft_denoise::{Error as RunError, product};
 use lightcraft_develop::DevelopSettings;
 use lightcraft_preview::Hasher128;
@@ -750,6 +750,28 @@ pub(crate) struct Active {
     pub onnx: PathBuf,
     pub fingerprint: String,
     pub model: ModelSlot,
+    /// A linear-RGB model installed beside a Bayer one: it denoises the raw files that are not Bayer (X-Trans).
+    pub companion: Option<Companion>,
+}
+
+/// The linear-RGB model that goes with the active Bayer model.
+pub(crate) struct Companion {
+    pub manifest: DenoiserManifest,
+    pub onnx: PathBuf,
+    pub fingerprint: String,
+    pub model: ModelSlot,
+}
+
+impl Active {
+    /// What a photo's product is made with: the active model, and for a Fujifilm raw (X-Trans, read by the linear
+    /// model) the companion too, so installing or changing that one remakes only those photos.
+    pub fn fingerprint_for(&self, p: &Photo) -> String {
+        let fuji = std::path::Path::new(&p.file_name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("raf"));
+        match &self.companion {
+            Some(c) if fuji => format!("{}+{}", self.fingerprint, c.fingerprint),
+            _ => self.fingerprint.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -826,6 +848,8 @@ pub(crate) struct JobSpec {
     pub manifest: DenoiserManifest,
     pub onnx: PathBuf,
     pub model: ModelSlot,
+    /// The linear-RGB model for raw files that are not Bayer (`manifest`, `.onnx`, slot), when there is one.
+    pub rgb: Option<(DenoiserManifest, PathBuf, ModelSlot)>,
     pub loader: Loader,
     /// Tiles run at once.
     pub parallel: usize,
@@ -866,14 +890,32 @@ impl Progress {
     }
 }
 
-/// The loaded model, loading it first when it is not (kept for the next photo).
-fn loaded(spec: &JobSpec) -> Result<Arc<dyn Model>, MakeError> {
-    if let Some(m) = spec.model.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+/// The loaded model of `slot`, loading it first when it is not (kept for the next photo).
+fn load_into(slot: &ModelSlot, onnx: &Path, manifest: &DenoiserManifest, loader: &Loader) -> Result<Arc<dyn Model>, MakeError> {
+    if let Some(m) = slot.lock().unwrap_or_else(PoisonError::into_inner).clone() {
         return Ok(m);
     }
-    let m = (spec.loader)(&spec.onnx, &spec.manifest).map_err(|e| MakeError::Failed(format!("the denoise model could not be loaded: {e}")))?;
-    *spec.model.lock().unwrap_or_else(PoisonError::into_inner) = Some(m.clone());
+    let m = loader(onnx, manifest).map_err(|e| MakeError::Failed(format!("the denoise model could not be loaded: {e}")))?;
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(m.clone());
     Ok(m)
+}
+
+/// The models of a job by what they take: the Bayer model and the linear-RGB one (the active model is either).
+fn models_of(spec: &JobSpec) -> (Option<(&DenoiserManifest, &Path, &ModelSlot)>, Option<(&DenoiserManifest, &Path, &ModelSlot)>) {
+    let active = (&spec.manifest, spec.onnx.as_path(), &spec.model);
+    match spec.manifest.domain {
+        Domain::BayerToRgb => (Some(active), spec.rgb.as_ref().map(|(m, o, s)| (m, o.as_path(), s))),
+        Domain::LinearRgb => (None, Some(active)),
+    }
+}
+
+/// What the model of a job reads.
+enum Input {
+    /// The normalised Bayer mosaic.
+    Bayer(lightcraft_raw::Normalized, Layout),
+    /// Demosaiced camera RGB of a sensor that is not Bayer, and the camera's white balance and matrix to linear
+    /// Rec.2020 (`rec2020 = matrix · (wb ⊙ camera)`).
+    Rgb(lightcraft_raster::Rgb32f, [f32; 3], lightcraft_raw::Mat3),
 }
 
 /// The cell `[(0,0), (1,0), (0,1), (1,1)]` colours of a Bayer mosaic and so its layout.
@@ -897,8 +939,9 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
         Some(r) => r(&spec.path).map_err(MakeError::Failed)?,
         None => std::fs::read(&spec.path).map_err(|e| MakeError::Failed(format!("{}: {e}", spec.path)))?,
     };
+    let (bayer_model, rgb_model) = models_of(spec);
     // the decode and the normalised mosaic wait their turn at the process-wide memory gate, as every decode does
-    let (mosaic, layout) = {
+    let input = {
         let _held = crate::memory::work_gate().acquire(bytes.len().saturating_mul(4));
         if lightcraft_raw::probe(&bytes).is_none() {
             return Err(MakeError::Unsupported("not a raw file".into()));
@@ -909,36 +952,50 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
             Err(e) => return Err(MakeError::Failed(e.to_string())),
         };
         drop(bytes);
-        if raw.cpp != 1 || !raw.cfa.as_ref().is_some_and(lightcraft_raw::Cfa::is_bayer) {
-            return Err(MakeError::Unsupported(
-                "only Bayer raw files can be denoised (this one has another sensor layout or is already demosaiced)".into(),
-            ));
+        let bayer = raw.cfa.as_ref().is_some_and(lightcraft_raw::Cfa::is_bayer);
+        if raw.cpp != 1 || raw.cfa.is_none() {
+            return Err(MakeError::Unsupported("only raw files with a colour filter can be denoised (this one is already demosaiced)".into()));
         }
         let n = raw.normalized().map_err(|e| MakeError::Failed(e.to_string()))?;
-        drop(raw);
-        let layout =
-            n.cfa.as_ref().and_then(layout_of).ok_or_else(|| MakeError::Unsupported("the colour filter layout is not a Bayer pattern".into()))?;
-        (n, layout)
+        if bayer && bayer_model.is_some() {
+            drop(raw);
+            let layout =
+                n.cfa.as_ref().and_then(layout_of).ok_or_else(|| MakeError::Unsupported("the colour filter layout is not a Bayer pattern".into()))?;
+            Input::Bayer(n, layout)
+        } else if rgb_model.is_some() {
+            // demosaiced first (X-Trans: the directional demosaic), then denoised in linear Rec.2020 as the model wants
+            let t = lightcraft_raw::color::camera_transform(&raw, lightcraft_raw::color::as_shot_white_xy(&raw));
+            drop(raw);
+            let rgb = lightcraft_raw::demosaic(&n, lightcraft_raw::Method::Ahd);
+            Input::Rgb(rgb, t.wb, t.matrix)
+        } else {
+            return Err(MakeError::Unsupported(if bayer {
+                "the denoise model in use reads Bayer raw files only".into()
+            } else {
+                "raw files that are not Bayer (Fujifilm X-Trans) need the linear RawNIND model: install it in Settings ▸ Denoise".into()
+            }));
+        }
     };
     if cancelled() {
         return Err(MakeError::Cancelled);
     }
     let decoded = began.elapsed();
-    let model = loaded(spec)?;
+    let (manifest, model) = match (&input, bayer_model, rgb_model) {
+        (Input::Bayer(..), Some((m, o, slot)), _) | (Input::Rgb(..), _, Some((m, o, slot))) => (m, load_into(slot, o, m, &spec.loader)?),
+        _ => return Err(MakeError::Failed("no model for this kind of raw file".into())),
+    };
+    let samples = match &input {
+        Input::Bayer(n, _) => n.data.len(),
+        Input::Rgb(img, ..) => img.data.len() * 3,
+    };
     // Packed input, returned RGB and the preceding group's RGB overlap while tiles run.
-    let scratch =
-        model.bytes_per_tile().saturating_add(128usize.saturating_mul(spec.manifest.tile as usize).saturating_mul(spec.manifest.tile as usize));
+    let scratch = model.bytes_per_tile().saturating_add(128usize.saturating_mul(manifest.tile as usize).saturating_mul(manifest.tile as usize));
     let (_, budget) = crate::memory::work_gate().usage();
     let parallel = spec.parallel.clamp(1, 4).min((budget / scratch.max(1)).max(1));
-    let _held = crate::memory::work_gate().acquire(mosaic.data.len().saturating_mul(20).saturating_add(scratch.saturating_mul(parallel)));
+    let _held = crate::memory::work_gate().acquire(samples.saturating_mul(20).saturating_add(scratch.saturating_mul(parallel)));
     let (runner, parallel) = model.runner(spec.run_on, parallel);
-    let params = Params {
-        tile: spec.manifest.tile as usize,
-        overlap: spec.manifest.overlap as usize,
-        gain: spec.manifest.gain,
-        clip: Some(CLIP),
-        parallel: parallel.max(1),
-    };
+    let params =
+        Params { tile: manifest.tile as usize, overlap: manifest.overlap as usize, gain: manifest.gain, clip: Some(CLIP), parallel: parallel.max(1) };
     let report = |done: usize, total: usize| {
         if let Some(p) = progress {
             p.total.store(total, Ordering::Relaxed);
@@ -953,8 +1010,10 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
         .thread_name(|i| format!("denoise-{i}"))
         .build()
         .map_err(|e| MakeError::Failed(format!("could not start the worker threads: {e}")))?;
-    let rgb = pool.install(|| denoise_bayer(&mosaic.data, mosaic.width, mosaic.height, layout, runner, &params, &ctl))?;
-    drop(mosaic);
+    let rgb = match input {
+        Input::Bayer(mosaic, layout) => pool.install(|| denoise_bayer(&mosaic.data, mosaic.width, mosaic.height, layout, runner, &params, &ctl))?,
+        Input::Rgb(camera, wb, matrix) => pool.install(|| denoise_camera_rgb(camera, wb, &matrix, runner, &params, &ctl))?,
+    };
     if cancelled() {
         return Err(MakeError::Cancelled);
     }
@@ -969,6 +1028,39 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
         );
     }
     Ok(true)
+}
+
+/// Denoise demosaiced camera RGB with a linear-RGB model: into white-balanced linear Rec.2020, the model, back to camera
+/// RGB; where the camera recorded white the picture keeps its own values, so highlight recovery finds them clipped.
+fn denoise_camera_rgb(
+    mut camera: lightcraft_raster::Rgb32f,
+    wb: [f32; 3],
+    matrix: &lightcraft_raw::Mat3,
+    runner: &dyn TileRunner,
+    params: &Params,
+    ctl: &Control<'_>,
+) -> Result<lightcraft_raster::Rgb32f, RunError> {
+    use rayon::prelude::*;
+    let back = matrix.inverse().ok_or_else(|| RunError::Input("the camera's colour matrix cannot be inverted".into()))?;
+    if wb.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(RunError::Input("the camera's white balance is not usable".into()));
+    }
+    let to_rec = |c: [f32; 3]| matrix.apply_f32([c[0] * wb[0], c[1] * wb[1], c[2] * wb[2]]);
+    let rec = lightcraft_raster::Rgb32f { width: camera.width, height: camera.height, data: camera.data.par_iter().map(|c| to_rec(*c)).collect() };
+    // (the clipped areas are kept below, in the camera's own values)
+    let plain = Params { tile: params.tile, overlap: params.overlap, gain: params.gain, clip: None, parallel: params.parallel };
+    let out = denoise_rgb(&rec, runner, &plain, ctl)?;
+    drop(rec);
+    let clip = params.clip.unwrap_or(f32::INFINITY);
+    let lo = clip - 0.03;
+    camera.data.par_iter_mut().zip(out.data.par_iter()).for_each(|(c, r)| {
+        let d = back.apply_f32(*r);
+        let d = [d[0] / wb[0], d[1] / wb[1], d[2] / wb[2]];
+        let s = ((c[0].max(c[1]).max(c[2]) - lo) / (clip - lo)).clamp(0.0, 1.0);
+        let s = s * s * (3.0 - 2.0 * s);
+        *c = [0, 1, 2].map(|k| d[k] + (c[k] - d[k]) * s);
+    });
+    Ok(camera)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1169,9 +1261,21 @@ impl Session {
             installed_models(dir).into_iter().find(|i| i.manifest.id == id)
         });
         let found = chosen.map(|i| (i.fingerprint(), i));
+        // beside a Bayer model, a linear-RGB one denoises the raw files that are not Bayer
+        let companion = match &found {
+            Some((_, i)) if i.manifest.domain == Domain::BayerToRgb => self
+                .denoise
+                .models_dir
+                .as_deref()
+                .and_then(|dir| installed_models(dir).into_iter().find(|c| c.manifest.domain == Domain::LinearRgb))
+                .map(|c| Companion { fingerprint: c.fingerprint(), manifest: c.manifest, onnx: c.onnx, model: Arc::new(Mutex::new(None)) }),
+            _ => None,
+        };
         let same = match (&self.denoise.active, &found) {
             (None, None) => true,
-            (Some(a), Some((fp, _))) => a.fingerprint == *fp,
+            (Some(a), Some((fp, _))) => {
+                a.fingerprint == *fp && a.companion.as_ref().map(|c| &c.fingerprint) == companion.as_ref().map(|c| &c.fingerprint)
+            }
             _ => false,
         };
         if same {
@@ -1184,6 +1288,7 @@ impl Session {
             onnx: i.onnx,
             fingerprint,
             model: Arc::new(Mutex::new(None)),
+            companion,
         });
         if let Some(r) = self.denoise.running.take() {
             r.progress.cancel_now();
@@ -1195,7 +1300,7 @@ impl Session {
 
     fn denoise_spec(&self, p: &Photo) -> Option<(DenoiseSpec, String)> {
         let (dir, active) = (self.denoise_products_dir()?, self.denoise.active.as_ref()?);
-        let key = product_key(&active.fingerprint, p);
+        let key = product_key(&active.fingerprint_for(p), p);
         Some((DenoiseSpec { product: product_path(&dir, &key), key: key.clone(), make: None }, key))
     }
 
@@ -1212,7 +1317,7 @@ impl Session {
                 products_in(&dir).into_iter().filter_map(|(p, _, _)| p.file_stem().and_then(|s| s.to_str()).map(str::to_string)).collect();
             if !names.is_empty() {
                 for p in self.catalog.photos().filter(|p| eligible(p) && running != Some(p.id)) {
-                    let key = product_key(&active.fingerprint, p);
+                    let key = product_key(&active.fingerprint_for(p), p);
                     if names.contains(&key) {
                         now.insert(p.id, DenoiseSpec { product: product_path(&dir, &key), key, make: None });
                     }
@@ -1371,6 +1476,7 @@ impl Session {
             manifest: active.manifest.clone(),
             onnx: active.onnx.clone(),
             model: active.model.clone(),
+            rgb: active.companion.as_ref().map(|c| (c.manifest.clone(), c.onnx.clone(), c.model.clone())),
             loader: self.denoise.loader.clone(),
             parallel,
             run_on: self.denoise.settings.run_on(),

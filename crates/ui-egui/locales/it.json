@@ -2046,5 +2046,7 @@
   "Sepia tones the lights first and reaches into the shadows as it grows; selenium tones the shadows first and deepens the blacks. Both: split toning.": "La seppia vira prima le luci e scende nelle ombre man mano che cresce; il selenio vira prima le ombre e approfondisce i neri. Entrambi: viraggio doppio.",
   "Skin": "Pelle",
   "Hair": "Capelli",
-  "Clothing": "Vestiti"
+  "Clothing": "Vestiti",
+  "Bright Lights": "Luci forti",
+  "LED Banding": "Bande LED"
 }
