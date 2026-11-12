@@ -83,6 +83,155 @@ impl Lut3d {
     }
 }
 
+/// Weight of [`Lut3d::fit`]'s pull towards the identity, relative to its smoothness weight.
+const RIDGE: f64 = 0.05;
+
+impl Lut3d {
+    /// The identity table of `size`³ entries.
+    pub fn identity(size: usize) -> Lut3d {
+        let s = (size.max(2) - 1) as f32;
+        let n = size.max(2);
+        let data = (0..n * n * n).map(|i| [(i % n) as f32 / s, ((i / n) % n) as f32 / s, (i / (n * n)) as f32 / s]).collect();
+        Lut3d { size: n, data, domain_min: [0.0; 3], domain_max: [1.0; 3], title: None }
+    }
+
+    /// The `.cube` text of this table.
+    pub fn to_cube(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = &self.title {
+            out.push_str(&format!("TITLE \"{}\"\n", t.replace('"', "'")));
+        }
+        out.push_str(&format!("LUT_3D_SIZE {}\n", self.size));
+        if self.domain_min != [0.0; 3] || self.domain_max != [1.0; 3] {
+            let [a, b, c] = self.domain_min;
+            let [d, e, f] = self.domain_max;
+            out.push_str(&format!("DOMAIN_MIN {a} {b} {c}\nDOMAIN_MAX {d} {e} {f}\n"));
+        }
+        for p in &self.data {
+            out.push_str(&format!("{:.6} {:.6} {:.6}\n", p[0], p[1], p[2]));
+        }
+        out
+    }
+
+    /// The `size`³ table (domain 0..1) that best maps each pair's input colour to its output colour, both
+    /// display-encoded 0..1: least squares on the trilinear lookup, plus `smooth` times a second-difference penalty
+    /// along each axis and a weak pull towards the identity, solved as a correction to the identity. Cells no pair reaches therefore stay close to the
+    /// identity and colour transitions stay smooth (no posterisation from a sparse sample). `None` without pairs,
+    /// with a non-finite value or an unsupported size.
+    pub fn fit(pairs: &[([f32; 3], [f32; 3])], size: usize, smooth: f32) -> Option<Lut3d> {
+        if pairs.is_empty() || !(2..=65).contains(&size) || !smooth.is_finite() || smooth < 0.0 {
+            return None;
+        }
+        if pairs.iter().any(|(a, b)| a.iter().chain(b).any(|v| !v.is_finite())) {
+            return None;
+        }
+        let n = size;
+        let cells = n * n * n;
+        let s = (n - 1) as f32;
+        // the eight cells and weights of each pair's input
+        let corners: Vec<([usize; 8], [f32; 8])> = pairs
+            .iter()
+            .map(|(x, _)| {
+                let mut i0 = [0usize; 3];
+                let mut t = [0.0f32; 3];
+                for k in 0..3 {
+                    let v = x[k].clamp(0.0, 1.0) * s;
+                    i0[k] = (v.floor() as usize).min(n - 2);
+                    t[k] = v - i0[k] as f32;
+                }
+                let mut idx = [0usize; 8];
+                let mut w = [0.0f32; 8];
+                for (c, (ix, wx)) in idx.iter_mut().zip(w.iter_mut()).enumerate() {
+                    let (dr, dg, db) = (c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                    *ix = (i0[0] + dr) + n * ((i0[1] + dg) + n * (i0[2] + db));
+                    let f = |d: usize, k: usize| if d == 1 { t[k] } else { 1.0 - t[k] };
+                    *wx = f(dr, 0) * f(dg, 1) * f(db, 2);
+                }
+                (idx, w)
+            })
+            .collect();
+        // the smoothness weight is per pair, so it means the same whatever the sample size
+        let lambda = f64::from(smooth) * pairs.len() as f64 / 30_000.0;
+        let ridge = lambda * RIDGE;
+        let identity = Lut3d::identity(n);
+        let mut data = identity.data.clone();
+        for ch in 0..3 {
+            // normal equations (AᵀA + λ LᵀL) δ = Aᵀ (y − A·identity), by conjugate gradients, matrix free
+            let apply = |d: &[f64], out: &mut [f64]| {
+                out.iter_mut().for_each(|o| *o = 0.0);
+                for (idx, w) in &corners {
+                    let v: f64 = idx.iter().zip(w).map(|(&i, &w)| d[i] * f64::from(w)).sum();
+                    for (&i, &w) in idx.iter().zip(w) {
+                        out[i] += v * f64::from(w);
+                    }
+                }
+                let at = |r: usize, g: usize, b: usize| r + n * (g + n * b);
+                for a in 0..n {
+                    for b in 0..n {
+                        for m in 0..n - 2 {
+                            for axis in 0..3 {
+                                let id = |k: usize| match axis {
+                                    0 => at(m + k, a, b),
+                                    1 => at(a, m + k, b),
+                                    _ => at(a, b, m + k),
+                                };
+                                let (i0, i1, i2) = (id(0), id(1), id(2));
+                                let l = d[i0] - 2.0 * d[i1] + d[i2];
+                                out[i0] += lambda * l;
+                                out[i1] -= 2.0 * lambda * l;
+                                out[i2] += lambda * l;
+                            }
+                        }
+                    }
+                }
+                // a weak pull towards the identity, so a trend the pairs show does not run on unchecked into
+                // colours they never reach (it fades over a few cells)
+                for (o, v) in out.iter_mut().zip(d) {
+                    *o += ridge * v;
+                }
+            };
+            let mut rhs = vec![0.0f64; cells];
+            for ((idx, w), (x, y)) in corners.iter().zip(pairs) {
+                let target = f64::from(y[ch]) - f64::from(x[ch].clamp(0.0, 1.0));
+                for (&i, &w) in idx.iter().zip(w) {
+                    rhs[i] += target * f64::from(w);
+                }
+            }
+            let mut delta = vec![0.0f64; cells];
+            let mut r = rhs.clone();
+            let mut p = r.clone();
+            let mut ap = vec![0.0f64; cells];
+            let mut rr: f64 = r.iter().map(|v| v * v).sum();
+            let stop = rr * 1e-12;
+            for _ in 0..600 {
+                if rr <= stop || rr == 0.0 {
+                    break;
+                }
+                apply(&p, &mut ap);
+                let pap: f64 = p.iter().zip(&ap).map(|(a, b)| a * b).sum();
+                if pap <= 0.0 || !pap.is_finite() {
+                    break;
+                }
+                let alpha = rr / pap;
+                for i in 0..cells {
+                    delta[i] += alpha * p[i];
+                    r[i] -= alpha * ap[i];
+                }
+                let next: f64 = r.iter().map(|v| v * v).sum();
+                let beta = next / rr;
+                rr = next;
+                for i in 0..cells {
+                    p[i] = r[i] + beta * p[i];
+                }
+            }
+            for (cell, d) in data.iter_mut().zip(&delta) {
+                cell[ch] = (cell[ch] + *d as f32).clamp(0.0, 1.0);
+            }
+        }
+        data.iter().all(|p| p.iter().all(|v| v.is_finite())).then_some(Lut3d { size: n, data, ..identity })
+    }
+}
+
 fn registry() -> &'static RwLock<HashMap<String, Arc<Lut3d>>> {
     static R: OnceLock<RwLock<HashMap<String, Arc<Lut3d>>>> = OnceLock::new();
     R.get_or_init(Default::default)
@@ -114,6 +263,55 @@ pub fn is_lut_profile(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fitted_table_reproduces_a_smooth_mapping_and_round_trips_as_cube() {
+        // a camera-like look: a contrast curve, warmer highlights, less saturated blues
+        let look = |c: [f32; 3]| {
+            let s = |v: f32| v * v * (3.0 - 2.0 * v);
+            let l = 0.3 * c[0] + 0.6 * c[1] + 0.1 * c[2];
+            [s(c[0]) + 0.04 * l, s(c[1]), 0.8 * s(c[2]) + 0.2 * l - 0.02 * l]
+        };
+        let mut pairs = Vec::new();
+        let mut seed = 7u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        for _ in 0..20_000 {
+            let c = [next(), next(), next()];
+            pairs.push((c, look(c)));
+        }
+        let lut = Lut3d::fit(&pairs, 17, 1.0).unwrap();
+        let mut worst = 0.0f32;
+        for _ in 0..2000 {
+            let c = [next(), next(), next()];
+            let (a, b) = (lut.apply(c), look(c));
+            worst = worst.max((0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f32::max));
+        }
+        assert!(worst < 0.05, "largest error {worst}");
+        let back = Lut3d::parse_cube(&lut.to_cube()).unwrap();
+        assert_eq!(back.size, 17);
+        assert!(back.data.iter().zip(&lut.data).all(|(a, b)| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-5)));
+    }
+
+    #[test]
+    fn colours_the_pairs_never_reach_stay_near_the_identity() {
+        // only dark greys are sampled; bright saturated colours must not be pulled anywhere
+        let pairs: Vec<_> = (0..500)
+            .map(|i| {
+                let v = i as f32 / 2000.0;
+                ([v; 3], [v * 1.2; 3])
+            })
+            .collect();
+        let lut = Lut3d::fit(&pairs, 9, 1.0).unwrap();
+        let far = lut.apply([1.0, 0.1, 0.9]);
+        assert!((far[0] - 1.0).abs() < 0.05 && (far[1] - 0.1).abs() < 0.05 && (far[2] - 0.9).abs() < 0.05, "{far:?}");
+        assert!((lut.apply([0.2; 3])[0] - 0.24).abs() < 0.02);
+        assert!(Lut3d::fit(&[], 9, 1.0).is_none());
+        assert!(Lut3d::fit(&[([f32::NAN; 3], [0.0; 3])], 9, 1.0).is_none());
+        assert!(Lut3d::fit(&pairs, 1, 1.0).is_none());
+    }
 
     fn cube(f: impl Fn([f32; 3]) -> [f32; 3], n: usize) -> String {
         let mut s = format!("TITLE \"test\"\nLUT_3D_SIZE {n}\n");

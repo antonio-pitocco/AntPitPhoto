@@ -30,6 +30,19 @@ mostra e le loro versioni web.*
   `packaging/macos/antpitphoto-icons.sh`): a print with its exhibition mat, in the 3:2 frame,
   where the shadows glow amber and the light dissolves into lavender.
 
+- **The camera's look on the raw** — `profile.fromCamera` (Develop: *Match Camera JPEG*): the open raw gets a
+  profile fitted to its own camera JPEG, so it starts from the film simulation (Classic Neg, Eterna, Acros…), the
+  Sony Creative Look or the picture style chosen in camera, and every edit still works on the raw. A 17³ 3D LUT
+  takes the photo's default rendering to the JPEG (least squares on 256 px renders of the central 90 %, with a
+  smoothness penalty and a weak pull towards the identity for colours the photo does not contain); it is kept
+  only when it brings held-out pixels closer, saved in the library's `Profiles/` and listed under
+  «Come in macchina» with Amount 0–200 %. Measured on the 240 px "look" scale (mean ΔE76 against the camera JPEG,
+  central 80 %): RX10 V with FL, 3.9–5.3 → 1.0–1.7 at 24, 103 and 600 mm; X100VI with Eterna, 4.5 → 1.9; a table
+  fitted on one FL photo brings another from 4.1 to 1.9. The film simulation is not read from the metadata yet:
+  the command is run on a photo of that look.
+- **Lens corrections for AntPitLab's bodies**: Sony A7C and RX10 V tables (see
+  [sony-lens-corrections.md](sony-lens-corrections.md)); other lenses, e.g. Canon EF-S, from a lensfun database
+  copied into `~/Library/Application Support/LightCraft/lensfun` ([lens-profiles.md](lens-profiles.md)).
 Libraries, presets and settings stay LightCraft's: AntPitPhoto opens the same libraries.
 
 ## Build and install (macOS, Apple silicon)
