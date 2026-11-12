@@ -43,6 +43,13 @@ mostra e le loro versioni web.*
 - **Lens corrections for AntPitLab's bodies**: Sony A7C and RX10 V tables (see
   [sony-lens-corrections.md](sony-lens-corrections.md)); other lenses, e.g. Canon EF-S, from a lensfun database
   copied into `~/Library/Application Support/LightCraft/lensfun` ([lens-profiles.md](lens-profiles.md)).
+- **AI denoise download** offered in Settings ▸ AI Denoise: the build enables `rawnind-model`, so RawNIND's
+  Bayer model can be fetched. Its weights are GPL-3.0: they are downloaded to the Mac at the user's request and
+  are not part of the app or of this repository (no permissively licensed model exists for the network the
+  denoiser runs; see [denoise.md](denoise.md)). Using them privately has no obligations; passing the model file on
+  falls under the GPL. Fuji X-Trans raws are not denoised yet: the engine runs the
+  Bayer model only.
+
 Libraries, presets and settings stay LightCraft's: AntPitPhoto opens the same libraries.
 
 ## Build and install (macOS, Apple silicon)

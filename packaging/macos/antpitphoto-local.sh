@@ -4,6 +4,8 @@
 # /Applications/AntPitPhoto.app with ditto, plus `antpitphoto-cli` in ~/bin. Bundle id
 # it.antpitlab.antpitphoto, its own icon (assets/app-icon/antpitphoto/). The interface starts in
 # Italian (LSEnvironment LIGHTCRAFT_LANGUAGE=it; Edit > Language still changes it).
+# AI denoise: built with `rawnind-model`, so Settings ▸ AI Denoise offers RawNIND's weights (GPL-3.0, downloaded
+# to this Mac at the user's request, never part of the app or of this repository; see docs/denoise.md).
 # See docs/antpitphoto.md.
 #
 #   CARGO_TARGET_DIR=/path/with/space/lightcraft-target packaging/macos/antpitphoto-local.sh [--skip-build] [--no-install]
@@ -28,7 +30,7 @@ BUNDLE_ID=it.antpitlab.antpitphoto
 APP="$WORK/$NAME.app"
 
 if [ "$SKIP_BUILD" = 0 ]; then
-  (cd "$ROOT" && cargo build --release --locked -p lightcraft -p lightcraft-cli --features lightcraft/heif,lightcraft-cli/heif)
+  (cd "$ROOT" && cargo build --release --locked -p lightcraft -p lightcraft-cli --features lightcraft/heif,lightcraft-cli/heif,lightcraft/rawnind-model,lightcraft-cli/rawnind-model)
 fi
 
 rm -rf "$WORK"
