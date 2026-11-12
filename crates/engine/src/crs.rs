@@ -338,11 +338,20 @@ pub fn to_partial(props: &Props, target: Target) -> Value {
     }
 
     // ---- Color grading (split toning fields are shared with the older split-toning panel)
-    n(o, "SplitToningShadowHue", "grading.shadows.hue");
-    n(o, "SplitToningShadowSaturation", "grading.shadows.sat");
+    // Lightroom writes shadow / highlight hue and saturation (and the balance) under the
+    // split-toning names; packets written by other tools carry them as `ColorGrade*` too, or only
+    // so: either name is read (split toning first), and both count as carried over.
+    let n2 = |o: &mut Value, a: &str, b: &str, path: &str| {
+        let (x, y) = (num(props, &format!("crs:{a}")), num(props, &format!("crs:{b}")));
+        if let Some(v) = x.or(y) {
+            put(o, path, json!(v));
+        }
+    };
+    n2(o, "SplitToningShadowHue", "ColorGradeShadowHue", "grading.shadows.hue");
+    n2(o, "SplitToningShadowSaturation", "ColorGradeShadowSat", "grading.shadows.sat");
     n(o, "ColorGradeShadowLum", "grading.shadows.lum");
-    n(o, "SplitToningHighlightHue", "grading.highlights.hue");
-    n(o, "SplitToningHighlightSaturation", "grading.highlights.sat");
+    n2(o, "SplitToningHighlightHue", "ColorGradeHighlightHue", "grading.highlights.hue");
+    n2(o, "SplitToningHighlightSaturation", "ColorGradeHighlightSat", "grading.highlights.sat");
     n(o, "ColorGradeHighlightLum", "grading.highlights.lum");
     n(o, "ColorGradeMidtoneHue", "grading.midtones.hue");
     n(o, "ColorGradeMidtoneSat", "grading.midtones.sat");
@@ -351,7 +360,7 @@ pub fn to_partial(props: &Props, target: Target) -> Value {
     n(o, "ColorGradeGlobalSat", "grading.global.sat");
     n(o, "ColorGradeGlobalLum", "grading.global.lum");
     n(o, "ColorGradeBlending", "grading.blending");
-    n(o, "SplitToningBalance", "grading.balance");
+    n2(o, "SplitToningBalance", "ColorGradeBalance", "grading.balance");
 
     // ---- Detail
     n(o, "Sharpness", "detail.sharpen_amount");
@@ -853,6 +862,24 @@ mod tests {
         let used_points = "<crs:PointColors><rdf:Seq><rdf:li>0.5, 0.2, 0.1, 10, 0, 0, 0, 0</rdf:li></rdf:Seq></crs:PointColors>";
         let got = unmapped(&preset_packet(r#"crs:HDREditMode="1" crs:FutureSlider="12""#, used_points));
         assert_eq!(got, ["FutureSlider", "PointColors"]);
+    }
+
+    #[test]
+    fn color_grade_names_are_read_and_not_reported() {
+        // both spellings (a Lightroom preset): split toning wins, nothing is reported missing
+        let both = r#"crs:SplitToningShadowHue="210" crs:SplitToningShadowSaturation="14" crs:SplitToningHighlightHue="40"
+            crs:SplitToningHighlightSaturation="9" crs:SplitToningBalance="+20" crs:ColorGradeShadowHue="210" crs:ColorGradeShadowSat="14"
+            crs:ColorGradeHighlightHue="40" crs:ColorGradeHighlightSat="9" crs:ColorGradeBalance="+20""#;
+        assert_eq!(unmapped(&preset_packet(both, "")), Vec::<String>::new());
+        // only the colour-grading names (another tool's packet): shadows and highlights still come through
+        let only = r#"crs:ColorGradeShadowHue="200" crs:ColorGradeShadowSat="12" crs:ColorGradeHighlightHue="45" crs:ColorGradeHighlightSat="8" crs:ColorGradeBalance="-10""#;
+        let p = to_partial(&props(&preset_packet(only, "")), Target::Any);
+        assert_eq!(p.pointer("/grading/shadows/hue"), Some(&json!(200.0)), "{p}");
+        assert_eq!(p.pointer("/grading/shadows/sat"), Some(&json!(12.0)), "{p}");
+        assert_eq!(p.pointer("/grading/highlights/hue"), Some(&json!(45.0)), "{p}");
+        assert_eq!(p.pointer("/grading/highlights/sat"), Some(&json!(8.0)), "{p}");
+        assert_eq!(p.pointer("/grading/balance"), Some(&json!(-10.0)), "{p}");
+        assert_eq!(unmapped(&preset_packet(only, "")), Vec::<String>::new());
     }
 
     #[test]
