@@ -17,6 +17,11 @@ In the Masking panel (M):
 - **Describe**: type what to select — `sky`, `trees`, `the red car` — and press Return. Every
   instance the model finds (score above 0.5) joins the mask; if nothing matches, nothing is
   created and you are told so.
+- **Person, Skin, Hair, Clothing**: one click each, no typing. They are Describe masks with a
+  fixed prompt — `person`; `face, neck, hand`; `hair`; `clothing, coat, jacket, dress, trousers,
+  hat` — named after the tile (when a collar or hood takes some hair along: − ▸ Describe… `hair`); edit them like any Describe mask
+  (+ / −, Edge). Unlike the heuristic Subject, Person separates a figure from a busy background
+  (a coat against a brick wall and the sea).
 - Several things at once: `car, road` (comma-separated) selects each and merges them.
 - **+ / −** under the selected mask (and the Add / Subtract / Intersect menus) combine
   selections: Describe `car`, click the mask, + ▸ Describe… `road`; − ▸ Describe… `people` takes

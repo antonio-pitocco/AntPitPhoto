@@ -8,28 +8,93 @@ use super::{CommandSpec, bad, bool_or, cmd, f64_or, has_active, ok, point, str_p
 use crate::segment::{Click, MAX_CLICKS};
 use crate::{Result, Session};
 
+/// The parameters each mask kind reads besides the common ones ([`COMMON_SHAPE_KEYS`]).
+fn shape_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "linear" => &["start", "end"],
+        "radial" => &["center", "rx", "ry", "angle", "feather"],
+        "luminanceRange" => &["lo", "hi", "loFeather", "hiFeather"],
+        "colorRange" => &["samples", "refine"],
+        "object" => &["points", "exclude", "seg"],
+        "prompt" => &["text", "seg"],
+        _ => &[],
+    }
+}
+
+/// Parameters `mask.add` / `mask.addComponent` read whatever the kind.
+const COMMON_SHAPE_KEYS: &[&str] = &["kind", "name", "op", "id", "invert"];
+
+/// A point given as `[x, y]` or `{x, y}`; `Ok(None)` when absent. Present but not a pair of
+/// finite numbers is an error: a geometry that silently fell back to the default would make a
+/// mask that isn't where the caller put it.
+fn point_param(p: &Value, key: &str, c: &str) -> Result<Option<Point>> {
+    let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let xy = match v {
+        Value::Array(a) if a.len() == 2 => a.first().and_then(Value::as_f64).zip(a.get(1).and_then(Value::as_f64)),
+        Value::Object(o) => o.get("x").and_then(Value::as_f64).zip(o.get("y").and_then(Value::as_f64)),
+        _ => None,
+    };
+    match xy {
+        Some((x, y)) if x.is_finite() && y.is_finite() => Ok(Some(Point::new(x, y))),
+        _ => Err(bad(c, format!("`{key}` must be a point [x, y] (normalized 0..1), not {v}"))),
+    }
+}
+
+/// A number under `key`, `default` when absent; present but not a finite number is an error.
+fn num_param(p: &Value, key: &str, default: f64, c: &str) -> Result<f64> {
+    match p.get(key).filter(|v| !v.is_null()) {
+        None => Ok(default),
+        Some(v) => v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad(c, format!("`{key}` must be a number, not {v}"))),
+    }
+}
+
 fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
+    // a misspelt geometry key (`centre`, `radius`, `from`) used to be ignored: the mask came out
+    // at its default place and the caller wasn't told
+    if let Some(o) = p.as_object()
+        && let Some(k) = o.keys().find(|k| !COMMON_SHAPE_KEYS.contains(&k.as_str()) && !shape_keys(kind).contains(&k.as_str()))
+    {
+        let known: Vec<&str> = shape_keys(kind).to_vec();
+        return Err(bad(
+            c,
+            format!(
+                "unknown parameter `{k}` for a {kind} mask{}",
+                if known.is_empty() { String::new() } else { format!(" (its shape takes {})", known.join(", ")) }
+            ),
+        ));
+    }
     Ok(match kind {
         "brush" => MaskShape::Brush { strokes: vec![] },
         "linear" => {
-            MaskShape::Linear { start: point(p, "start").unwrap_or(Point::new(0.5, 0.25)), end: point(p, "end").unwrap_or(Point::new(0.5, 0.6)) }
+            let start = point_param(p, "start", c)?.unwrap_or(Point::new(0.5, 0.25));
+            let end = point_param(p, "end", c)?.unwrap_or(Point::new(0.5, 0.6));
+            if (start.x - end.x).hypot(start.y - end.y) < 1e-6 {
+                return Err(bad(c, "`start` and `end` of a linear mask must be different points"));
+            }
+            MaskShape::Linear { start, end }
         }
-        "radial" => MaskShape::Radial {
-            center: point(p, "center").unwrap_or(Point::new(0.5, 0.5)),
-            rx: f64_or(p, "rx", 0.22),
-            ry: f64_or(p, "ry", 0.16),
-            angle: f64_or(p, "angle", 0.0),
-            feather: f64_or(p, "feather", 50.0),
-            invert: bool_or(p, "invert", false),
-        },
+        "radial" => {
+            let (rx, ry) = (num_param(p, "rx", 0.22, c)?, num_param(p, "ry", 0.16, c)?);
+            if rx <= 0.0 || ry <= 0.0 {
+                return Err(bad(c, "`rx` and `ry` of a radial mask must be above 0"));
+            }
+            MaskShape::Radial {
+                center: point_param(p, "center", c)?.unwrap_or(Point::new(0.5, 0.5)),
+                rx,
+                ry,
+                angle: num_param(p, "angle", 0.0, c)?,
+                feather: num_param(p, "feather", 50.0, c)?,
+                invert: bool_or(p, "invert", false),
+            }
+        }
         "sky" => MaskShape::Sky,
         "subject" => MaskShape::Subject,
         "background" => MaskShape::Background,
         "luminanceRange" => MaskShape::LuminanceRange {
-            lo: f64_or(p, "lo", 0.6),
-            hi: f64_or(p, "hi", 1.0),
-            lo_feather: f64_or(p, "loFeather", 0.1),
-            hi_feather: f64_or(p, "hiFeather", 0.1),
+            lo: num_param(p, "lo", 0.6, c)?,
+            hi: num_param(p, "hi", 1.0, c)?,
+            lo_feather: num_param(p, "loFeather", 0.1, c)?,
+            hi_feather: num_param(p, "hiFeather", 0.1, c)?,
         },
         "colorRange" => {
             let samples: Vec<[f64; 3]> = p
@@ -490,6 +555,40 @@ pub fn specs() -> Vec<CommandSpec> {
                 masks_edit(s, "mask.refine", "Refine Edges", |masks, _| {
                     let i = find(masks, mid, "mask.refine")?;
                     masks[i].refine = v;
+                    Ok(())
+                })
+            }
+        ),
+        cmd!(
+            "mask.curve",
+            "Set Mask Curve",
+            [],
+            None,
+            "{id?: maskId, channel?: master|red|green|blue, points: [[x,y],…] in 0..1 (display-encoded input → output, like develop.curve; [] or [[0,0],[1,1]] resets it)} — a tone curve that acts only inside the mask: dodge and burn, local contrast (rendered on the CPU)",
+            has_active,
+            |s, p| {
+                const C: &str = "mask.curve";
+                let ch = str_param(p, "channel").unwrap_or("master").to_string();
+                let arr = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(C, "missing `points` ([[x, y], …])"))?;
+                if arr.len() > lightcraft_develop::MaskCurve::MAX_POINTS {
+                    return Err(bad(C, format!("at most {} points", lightcraft_develop::MaskCurve::MAX_POINTS)));
+                }
+                let mut pts = Vec::with_capacity(arr.len());
+                for q in arr {
+                    let (x, y) = q
+                        .get(0)
+                        .and_then(Value::as_f64)
+                        .zip(q.get(1).and_then(Value::as_f64))
+                        .filter(|(x, y)| x.is_finite() && y.is_finite())
+                        .ok_or_else(|| bad(C, format!("a point is [x, y] with numbers in 0..1, not {q}")))?;
+                    pts.push(Point::new(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)));
+                }
+                pts.sort_by(|a, b| a.x.total_cmp(&b.x));
+                let mid = mask_id(p, s.active_mask, C)?;
+                masks_edit(s, C, "Mask Curve", |masks, _| {
+                    let i = find(masks, mid, C)?;
+                    let slot = masks[i].curve.channel_mut(&ch).ok_or_else(|| bad(C, format!("unknown channel `{ch}` (master|red|green|blue)")))?;
+                    *slot = pts;
                     Ok(())
                 })
             }

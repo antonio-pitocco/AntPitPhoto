@@ -542,7 +542,7 @@ fn section(
 // ------------------------------------------------------------------------------ histogram
 
 /// The current photo's existing preview histogram, shared by Histogram and Tone Curve.
-fn preview_histogram(app: &LightcraftApp, id: PhotoId) -> Option<lightcraft_raster::Histogram> {
+pub(crate) fn preview_histogram(app: &LightcraftApp, id: PhotoId) -> Option<lightcraft_raster::Histogram> {
     app.renderer
         .textures
         .get(&Slot::Main)
@@ -895,25 +895,9 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
     let resp = ui.interact(r, egui::Id::new(("curve", &ch)), Sense::click_and_drag());
     register(ui.ctx(), "curve", r);
     resp.context_menu(|ui| curve_reset_menu(app, ui, &ch));
+    curve_graph_background(ui, r, preview_histogram(app, id).as_ref(), &ch);
     let p = ui.painter();
-    p.rect_filled(r, 2.0, t.canvas);
-    if let Some(hist) = preview_histogram(app, id) {
-        draw_curve_histogram(p, r, &hist, &ch);
-    }
-    for i in 1..4 {
-        let f = i as f32 / 4.0;
-        p.line_segment(
-            [pos2(r.left() + r.width() * f, r.top()), pos2(r.left() + r.width() * f, r.bottom())],
-            Stroke::new(1.0, Color32::from_gray(52)),
-        );
-        p.line_segment(
-            [pos2(r.left(), r.top() + r.height() * f), pos2(r.right(), r.top() + r.height() * f)],
-            Stroke::new(1.0, Color32::from_gray(52)),
-        );
-    }
-    p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.0, Color32::from_gray(70)));
     let to_screen = |x: f64, y: f64| pos2(r.left() + x as f32 * r.width(), r.bottom() - y as f32 * r.height());
-    let from_screen = |q: Pos2| (((q.x - r.left()) / r.width()).clamp(0.0, 1.0) as f64, ((r.bottom() - q.y) / r.height()).clamp(0.0, 1.0) as f64);
     if ch == "parametric" {
         // draw the effective parametric curve by sampling the pipeline's region curve approximation
         let c = &d.curve;
@@ -952,9 +936,36 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
         };
         if v.is_empty() { vec![Point::new(0.0, 0.0), Point::new(1.0, 1.0)] } else { v.clone() }
     };
-    let pts = pts_of(d);
+    point_curve_interact(app, ui, r, &resp, "develop", &ch, pts_of(d), "develop.curve", json!({}), "Tone Curve");
+    curve_footer(app, ui, d);
+    control(app, ui, d, "curve.refineSaturation", true);
+    let _ = id;
+}
+
+/// The point curve in the graph `r` (its response `resp`): draws it and its points, and turns
+/// clicks and drags into `command {channel: ch, points, ...extra}` (`develop.curve`, `mask.curve`).
+/// Drag a point (both axes, between its neighbours; ⌥ = fine), drag empty space to add and drag a
+/// new point, click empty space to add, double-click a point to delete it. `key` keeps two graphs'
+/// drags apart; `label` names the undo step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn point_curve_interact(
+    app: &mut LightcraftApp,
+    ui: &mut egui::Ui,
+    r: Rect,
+    resp: &egui::Response,
+    key: &str,
+    ch: &str,
+    pts: Vec<Point>,
+    command: &str,
+    extra: serde_json::Value,
+    label: &str,
+) {
+    let t = Tokens::get(ui.ctx());
+    let p = ui.painter();
+    let to_screen = |x: f64, y: f64| pos2(r.left() + x as f32 * r.width(), r.bottom() - y as f32 * r.height());
+    let from_screen = |q: Pos2| (((q.x - r.left()) / r.width()).clamp(0.0, 1.0) as f64, ((r.bottom() - q.y) / r.height()).clamp(0.0, 1.0) as f64);
     let curve = lightcraft_color::spline::MonotoneCurve::new(&pts.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>());
-    let color = match ch.as_str() {
+    let color = match ch {
         "red" => hex("#dd3333"),
         "green" => hex("#33bb55"),
         "blue" => hex("#3377ee"),
@@ -964,7 +975,7 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
     p.add(egui::Shape::line(line, Stroke::new(2.0, color)));
     // interaction: drag a point (both axes, between its neighbours; ⌥ = fine), drag empty space to add and
     // drag a new point, click empty space to add, double-click a point to delete it
-    let drag_id = egui::Id::new(("curve-drag", &ch));
+    let drag_id = egui::Id::new(("curve-drag", key, ch));
     // the point being dragged (stored as `Option<usize>` so a stale value can be cleared)
     let mut dragging: Option<usize> = ui.data(|dd| dd.get_temp::<Option<usize>>(drag_id)).flatten();
     let nearest = |q: Pos2| pts.iter().enumerate().map(|(i, p)| (i, to_screen(p.x, p.y).distance(q))).min_by(|a, b| a.1.total_cmp(&b.1));
@@ -1008,7 +1019,7 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
         && let Some(q) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
     {
         // pick the point under the press, not where the pointer is once the drag threshold passed
-        let _ = app.run("develop.beginInteraction", json!({"label": "Tone Curve"}));
+        let _ = app.run("develop.beginInteraction", json!({"label": label}));
         match nearest(q) {
             Some((i, dist)) if dist < 10.0 => dragging = Some(i),
             _ => {
@@ -1059,16 +1070,40 @@ fn curve_editor(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, d: &Dev
     }
     if let Some(v) = new_pts {
         let arr: Vec<[f64; 2]> = v.iter().map(|p| [p.x, p.y]).collect();
-        let _ = app.run("develop.curve", json!({"channel": ch, "points": arr}));
+        let mut params = json!({"channel": ch, "points": arr});
+        if let (Some(o), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            o.extend(extra.clone());
+        }
+        let _ = app.run(command, params);
     }
     if resp.drag_stopped() {
         dragging = None;
         let _ = app.run("develop.endInteraction", json!({}));
     }
     ui.data_mut(|dd| dd.insert_temp(drag_id, dragging));
-    curve_footer(app, ui, d);
-    control(app, ui, d, "curve.refineSaturation", true);
-    let _ = id;
+}
+
+/// The curve graph's background: the canvas, the photo's histogram for `ch`, the quarter grid
+/// and the diagonal.
+pub(crate) fn curve_graph_background(ui: &egui::Ui, r: Rect, hist: Option<&lightcraft_raster::Histogram>, ch: &str) {
+    let t = Tokens::get(ui.ctx());
+    let p = ui.painter();
+    p.rect_filled(r, 2.0, t.canvas);
+    if let Some(hist) = hist {
+        draw_curve_histogram(p, r, hist, ch);
+    }
+    for i in 1..4 {
+        let f = i as f32 / 4.0;
+        p.line_segment(
+            [pos2(r.left() + r.width() * f, r.top()), pos2(r.left() + r.width() * f, r.bottom())],
+            Stroke::new(1.0, Color32::from_gray(52)),
+        );
+        p.line_segment(
+            [pos2(r.left(), r.top() + r.height() * f), pos2(r.right(), r.top() + r.height() * f)],
+            Stroke::new(1.0, Color32::from_gray(52)),
+        );
+    }
+    p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.0, Color32::from_gray(70)));
 }
 
 /// The row under the curve graph: point-curve presets and reset every curve.
@@ -1404,6 +1439,16 @@ fn grading(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &DevelopSettings, phot
         }
     }
     for c in ["grading.blending", "grading.balance"] {
+        control(app, ui, d, c, true);
+    }
+    // print toning (sepia, selenium, both): the darkroom's toners, by density
+    let t = Tokens::get(ui.ctx());
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 10, bottom: 2 }).show(ui, |ui| {
+        ui.label(RichText::new(crate::i18n::tr("Toning")).font(t.font(12.0)).color(t.text_label)).on_hover_text(crate::i18n::tr(
+            "Sepia tones the lights first and reaches into the shadows as it grows; selenium tones the shadows first and deepens the blacks. Both: split toning.",
+        ));
+    });
+    for c in ["toning.sepia", "toning.selenium", "toning.strength"] {
         control(app, ui, d, c, true);
     }
 }

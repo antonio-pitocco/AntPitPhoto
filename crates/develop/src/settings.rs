@@ -124,6 +124,10 @@ pub struct DevelopSettings {
     pub point_colors: Vec<PointColor>,
     pub bw_mix: BwMix,
     pub grading: ColorGrading,
+    /// Chemical toning of the print (sepia, selenium, both): see [`Toning`]. Not written while
+    /// off, so settings without it keep their JSON and `hash64`.
+    #[serde(skip_serializing_if = "Toning::is_off")]
+    pub toning: Toning,
     pub effects: Effects,
     pub vignette: Vignette,
     pub grain: Grain,
@@ -159,6 +163,7 @@ impl Default for DevelopSettings {
             point_colors: Vec::new(),
             bw_mix: BwMix::default(),
             grading: ColorGrading::default(),
+            toning: Toning::default(),
             effects: Effects::default(),
             vignette: Vignette::default(),
             grain: Grain::default(),
@@ -532,6 +537,39 @@ impl Default for ColorGrading {
 impl ColorGrading {
     pub fn is_neutral(&self) -> bool {
         [self.shadows, self.midtones, self.highlights, self.global].iter().all(|w| w.sat == 0.0 && w.lum == 0.0)
+    }
+}
+
+/// Toning of the print, as in the darkroom, applied last (after curves and grain), on the
+/// print's lightness. The amounts say how far the toner reaches, not only how strong it is:
+///
+/// - **Sepia** (bleach and sulphide redevelopment) tones the light densities first; as `sepia`
+///   grows it reaches down into the shadows. Warm brown; the toned silver is slightly less dense.
+/// - **Selenium** tones the densest silver first; as `selenium` grows it climbs towards the
+///   lights. Cool purple-brown, and the blacks deepen (higher Dmax).
+/// - Both: split (double) toning, sepia in the lights and selenium in the shadows.
+///
+/// `strength` (0..100, 50 = a normal bath) scales the colour; paper white is never tinted.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Toning {
+    /// 0..100: how far down from the lights sepia reaches.
+    pub sepia: f64,
+    /// 0..100: how far up from the shadows selenium reaches.
+    pub selenium: f64,
+    /// 0..100.
+    pub strength: f64,
+}
+
+impl Default for Toning {
+    fn default() -> Self {
+        Self { sepia: 0.0, selenium: 0.0, strength: 50.0 }
+    }
+}
+
+impl Toning {
+    pub fn is_off(&self) -> bool {
+        self.sepia <= 0.0 && self.selenium <= 0.0
     }
 }
 
@@ -1010,6 +1048,51 @@ pub struct Mask {
     /// Refine Edges 0..100: the mask's edges snap to the photo's (guided filter).
     #[serde(skip_serializing_if = "is_zero")]
     pub refine: f64,
+    /// A tone curve that acts only inside the mask (dodge and burn, local contrast).
+    #[serde(skip_serializing_if = "MaskCurve::is_identity")]
+    pub curve: MaskCurve,
+}
+
+/// A point curve inside a mask: like the Tone Curve panel's point curves (display-encoded values
+/// 0..1, master then the red / green / blue channels), blended in by the mask's coverage. Empty
+/// or two-point diagonal curves change nothing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaskCurve {
+    pub master: Vec<Point>,
+    pub red: Vec<Point>,
+    pub green: Vec<Point>,
+    pub blue: Vec<Point>,
+}
+
+impl MaskCurve {
+    /// Most points a mask curve keeps per channel (hostile documents can't make it explode).
+    pub const MAX_POINTS: usize = 32;
+
+    pub fn is_identity(&self) -> bool {
+        [&self.master, &self.red, &self.green, &self.blue].iter().all(|c| ToneCurve::point_curve_is_identity(c))
+    }
+
+    /// The channel's points (`master`, `red`, `green`, `blue`).
+    pub fn channel_mut(&mut self, channel: &str) -> Option<&mut Vec<Point>> {
+        match channel {
+            "master" | "rgb" => Some(&mut self.master),
+            "red" => Some(&mut self.red),
+            "green" => Some(&mut self.green),
+            "blue" => Some(&mut self.blue),
+            _ => None,
+        }
+    }
+
+    pub fn channel(&self, channel: &str) -> Option<&Vec<Point>> {
+        match channel {
+            "master" | "rgb" => Some(&self.master),
+            "red" => Some(&self.red),
+            "green" => Some(&self.green),
+            "blue" => Some(&self.blue),
+            _ => None,
+        }
+    }
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -1018,7 +1101,16 @@ fn is_zero(v: &f64) -> bool {
 
 impl Default for Mask {
     fn default() -> Self {
-        Self { id: 0, name: "Mask 1".into(), visible: true, invert: false, components: Vec::new(), adjust: LocalAdjustments::default(), refine: 0.0 }
+        Self {
+            id: 0,
+            name: "Mask 1".into(),
+            visible: true,
+            invert: false,
+            components: Vec::new(),
+            adjust: LocalAdjustments::default(),
+            refine: 0.0,
+            curve: MaskCurve::default(),
+        }
     }
 }
 

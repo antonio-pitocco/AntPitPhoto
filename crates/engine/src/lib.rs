@@ -121,6 +121,10 @@ pub struct UndoEntry {
 
 /// The one photo an undo step changes, when it changes exactly one through its edit, rating, flag,
 /// label, metadata or versions (`depth` bounds nested batches).
+/// Commands whose own `photo` parameter means something else than "the photo this call is meant
+/// for" (see [`Session::execute`]).
+const OWN_PHOTO_PARAM: &[&str] = &["album.setCover"];
+
 fn single_photo(op: &Op, depth: usize) -> Option<PhotoId> {
     match op {
         Op::SetDevelop { id, .. }
@@ -417,6 +421,35 @@ impl Session {
         }
         let empty = Value::Object(Default::default());
         let params = if params.is_null() { &empty } else { params };
+        // `photo`: the photo the caller means to act on (an agent after a `library.select` that may
+        // have failed): the command runs only when it is the active photo, so an edit never lands on
+        // another photo. Removed before the command sees its params.
+        let stripped;
+        let params = match params.get("photo").filter(|_| !OWN_PHOTO_PARAM.contains(&id)) {
+            None => params,
+            Some(v) => {
+                let want =
+                    v.as_u64().ok_or_else(|| EngineError::BadParams { cmd: id.into(), msg: "`photo` must be a photo id (a number)".into() })?;
+                match self.active() {
+                    Some(PhotoId(have)) if have == want => {}
+                    have => {
+                        let now = have.map_or("no photo is active".to_string(), |p| format!("the active photo is {}", p.0));
+                        return Err(EngineError::BadParams {
+                            cmd: id.into(),
+                            msg: format!(
+                                "photo {want} is not the active photo ({now}): nothing was changed; select it first (library.select {{\"ids\": [{want}]}})"
+                            ),
+                        });
+                    }
+                }
+                let mut p = params.clone();
+                if let Some(o) = p.as_object_mut() {
+                    o.remove("photo");
+                }
+                stripped = p;
+                &stripped
+            }
+        };
         self.run_command(id, spec.journal.then_some(params), |s| (spec.run)(s, params))
     }
 

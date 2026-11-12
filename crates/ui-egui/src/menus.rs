@@ -840,7 +840,13 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         }
         "view.maskOverlay" => {
             app.ui.mask_overlay = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.mask_overlay);
-            Ok(json!({"maskOverlay": app.ui.mask_overlay}))
+            // the overlay is drawn by the Masking panel: showing it for a photo with masks opens
+            // the panel, so the overlay is on screen (and in a screenshot), not just switched on
+            let has_masks = app.session.active().and_then(|id| app.session.develop_of(id)).is_some_and(|d| !d.masks.is_empty());
+            if app.ui.mask_overlay && has_masks && app.ui.right != RightPanel::Masking {
+                panel(app, &ctx, RightPanel::Masking, "Masking");
+            }
+            Ok(json!({"maskOverlay": app.ui.mask_overlay, "masking": app.ui.right == RightPanel::Masking}))
         }
         "view.maskOverlayAll" => {
             app.ui.mask_overlay_all = !app.ui.mask_overlay_all;

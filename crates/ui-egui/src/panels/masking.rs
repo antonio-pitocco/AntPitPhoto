@@ -93,9 +93,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 0, bottom: 10 }).show(ui, |ui| {
         ui.label(egui::RichText::new(crate::i18n::tr("Create New Mask")).color(t.text_dim));
         ui.add_space(6.0);
-        let tiles: [(&str, &str, Icon); 10] = [
+        let tiles: [(&str, &str, Icon); 14] = [
             ("object", "Object", Icon::Subject),
             ("prompt", "Describe", Icon::Subject),
+            ("person", "Person", Icon::Subject),
+            ("skin", "Skin", Icon::Subject),
+            ("hair", "Hair", Icon::Subject),
+            ("clothing", "Clothing", Icon::Subject),
             ("subject", "Subject", Icon::Subject),
             ("sky", "Sky", Icon::Sky),
             ("background", "Background", Icon::Subject),
@@ -138,6 +142,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                         }
                         "object" => start_object(app, ui.ctx(), "new"),
                         "prompt" => start_describe(app, "new"),
+                        "person" | "skin" | "hair" | "clothing" => one_click_concept(app, ui.ctx(), kind, label),
                         "brush" => {
                             let _ = app.run("tool.brush", json!({"new": true}));
                         }
@@ -396,6 +401,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     };
     let out = slider(ui, &amt, m.adjust.amount, true, None);
     apply_slider_out(app, &amt, out, |app, v| app.run("mask.adjust", json!({"values": {"amount": v}})));
+    mask_curve(app, ui, id, &m);
     let refine = ControlSpec {
         id: "refine",
         label: "Refine Edges",
@@ -731,6 +737,33 @@ pub(crate) fn begin_ai(app: &mut LightcraftApp, kind: &str, op: &str) -> Result<
     }
 }
 
+/// What the one-click people tiles ask SAM 3 for: concept prompts it finds reliably on portraits
+/// (each phrase is searched on its own and the results merged, as in Describe).
+pub(crate) fn concept_prompt(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "person" => "person",
+        // the bare parts only: "arm" and "leg" also find sleeves and trouser legs
+        "skin" => "face, neck, hand",
+        "hair" => "hair",
+        "clothing" => "clothing, coat, jacket, dress, trousers, hat",
+        _ => return None,
+    })
+}
+
+/// A one-click Person / Skin / Hair / Clothing mask: a Describe mask with a fixed concept prompt,
+/// named after the tile. Without the model, offers its download as Describe does.
+fn one_click_concept(app: &mut LightcraftApp, ctx: &egui::Context, kind: &str, label: &str) {
+    let Some(text) = concept_prompt(kind) else { return };
+    if needs_model(app, "prompt", "new") {
+        return;
+    }
+    // (the desktop app selects in the background: the mask appears when SAM 3 has found it)
+    match app.run("mask.add", json!({"kind": "prompt", "text": text, "name": label})) {
+        Ok(_) => app.toast(ctx, crate::i18n::tr("Selecting…")),
+        Err(e) => app.ai_error(ctx, e, Some(("prompt", "new"))),
+    }
+}
+
 /// Open the Describe field (a new mask, or a component combined by `op`).
 pub(crate) fn start_describe(app: &mut LightcraftApp, op: &str) {
     if needs_model(app, "prompt", op) {
@@ -862,6 +895,58 @@ fn brush_settings(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             }
         }
     }
+}
+
+/// The mask's own tone curve (`mask.curve`): master and red / green / blue, under the sliders.
+/// Dodge and burn with real control: pull the shadows down inside a mask without touching the
+/// rest, or give the sky its own contrast.
+fn mask_curve(app: &mut LightcraftApp, ui: &mut egui::Ui, photo: PhotoId, m: &lightcraft_develop::Mask) {
+    let t = Tokens::get(ui.ctx());
+    let ch_id = egui::Id::new(("maskCurveChannel", m.id));
+    let mut ch: String = ui.data(|d| d.get_temp::<String>(ch_id)).unwrap_or_else(|| "master".into());
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 10, bottom: 4 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(crate::i18n::tr("Curve")).font(t.font(12.0)).color(t.text_label));
+            for (key, color) in [
+                ("master", egui::Color32::WHITE),
+                ("red", egui::Color32::from_rgb(0xdd, 0x33, 0x33)),
+                ("green", egui::Color32::from_rgb(0x33, 0xbb, 0x55)),
+                ("blue", egui::Color32::from_rgb(0x33, 0x77, 0xee)),
+            ] {
+                let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                register(ui.ctx(), format!("maskCurveChannel:{key}"), r);
+                ui.painter().circle_stroke(r.center(), 6.5, Stroke::new(2.0, color));
+                if ch == key {
+                    ui.painter().circle_filled(r.center(), 3.0, color);
+                }
+                if resp.clicked() {
+                    ch = key.to_string();
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !m.curve.is_identity() && text_button(ui, "maskCurveReset", crate::i18n::tr("Reset"), false).clicked() {
+                    for c in ["master", "red", "green", "blue"] {
+                        let _ = app.run("mask.curve", json!({"id": m.id, "channel": c, "points": []}));
+                    }
+                }
+            });
+        });
+    });
+    ui.data_mut(|d| d.insert_temp(ch_id, ch.clone()));
+    let w = ui.available_width();
+    let side = (w - 48.0).clamp(80.0, 260.0);
+    let (outer, _) = ui.allocate_exact_size(vec2(w, side + 12.0), Sense::hover());
+    let r = Rect::from_min_size(pos2(outer.left() + 24.0, outer.top() + 6.0), vec2(side, side));
+    let resp = ui.interact(r, egui::Id::new(("maskCurve", m.id, &ch)), Sense::click_and_drag());
+    register(ui.ctx(), "maskCurve", r);
+    super::edit::curve_graph_background(ui, r, super::edit::preview_histogram(app, photo).as_ref(), &ch);
+    let pts = m
+        .curve
+        .channel(&ch)
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![lightcraft_geom::Point::new(0.0, 0.0), lightcraft_geom::Point::new(1.0, 1.0)]);
+    super::edit::point_curve_interact(app, ui, r, &resp, "mask", &ch, pts, "mask.curve", json!({"id": m.id}), "Mask Curve");
 }
 
 #[cfg(test)]

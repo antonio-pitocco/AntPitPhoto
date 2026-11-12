@@ -49,6 +49,34 @@ mostra e le loro versioni web.*
   denoiser runs; see [denoise.md](denoise.md)). Using them privately has no obligations; passing the model file on
   falls under the GPL. Fuji X-Trans raws are not denoised yet: the engine runs the
   Bayer model only.
+- **Printer profile on export** — `printProfile` (path of an RGB printer + paper ICC profile) and
+  `printIntent` (`perceptual`, default, or `relative`) in `app.export`: the JPEG, PNG or TIFF (8 or
+  16 bit) is converted into the printer's space and tagged with its profile, ready for a home
+  print with the driver's colour management off. Soft proof first with the same profile (View ▸
+  Soft Proof). Paper border, if any, is converted too (paper white stays paper white).
+- **Toning** (Color Grading panel, `toning.sepia`, `toning.selenium`, `toning.strength`): a
+  darkroom toner, not a split tone. Sepia acts on the lights first and reaches the shadows as it
+  grows (bleach-and-redevelop); selenium acts on the shadows first and deepens the blacks
+  (Dmax). Both together give a double-toned print. Strength scales both.
+- **Curves inside masks** (`mask.curve {id?, channel?: master|red|green|blue, points}`, Masking
+  panel ▸ Mask Curve): a point curve that acts only inside the mask, blended by its coverage —
+  dodging and burning with a grade per zone (hard contrast in the shadows, soft in the sky).
+- **One-click people masks** (Masking panel: Person, Skin, Hair, Clothing): SAM 3 concept prompts
+  (`person`; `face, neck, hand`; `hair`; `clothing, coat, jacket, dress, trousers, hat`). From a script:
+  `mask.add {"kind": "prompt", "text": "person"}`. They need the SAM 3 model ([ai-masks.md](ai-masks.md)).
+- **Content-aware fill that keeps thin structures**: `spot.add {mode: "fill"}` decides the hole
+  in structure order (exemplar-based inpainting, Criminisi–Pérez–Toyama 2004) before the
+  patch-based completion, so a pole, a cable or a horizon crossing the spot is continued.
+- **Faithful preview without exporting** — `develop.renderPreview {path, size?}`: the active photo
+  through the export pipeline (every mask and matte at full quality) at `size` px on the long
+  edge, unlike a screenshot taken while finer masks are still being computed.
+- **Commands bound to a photo** — every command accepts `photo` (an id): when it is not the active
+  photo the command fails and changes nothing (a script never edits the wrong photo because a
+  selection did not happen).
+- **Mask geometry is taken as given or refused**: misspelt keys, malformed points, a linear mask
+  whose start equals its end, a radial mask without size are errors, not silent defaults.
+- **Export results say what happened to existing files**: `replaced: true` when a file was
+  overwritten, `renamedFrom` when a free name (`-2`) was used instead.
 
 Libraries, presets and settings stay LightCraft's: AntPitPhoto opens the same libraries.
 
@@ -73,8 +101,9 @@ antpitphoto-cli run --library LIB preset.import '{"paths":["PRESETS/MyLook"]}'
 
 ## Known limits (from LightCraft)
 
-- No Print module and no conversion to a paper+printer ICC profile on export: soft proofing with
-  the paper profile is there (View ▸ Soft Proof, S); the lab does the conversion.
+- No Print module (page layout, printer dialog): print proofs go through the export with
+  `printProfile`, then the printer driver with its colour management off; CMYK printer profiles
+  and black-point compensation are not available.
 - The border is not drawn in the preview: it is only in the exported file.
 
 ## Licence and attribution

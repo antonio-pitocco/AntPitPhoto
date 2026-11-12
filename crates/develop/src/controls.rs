@@ -240,6 +240,9 @@ controls! {
     "grading.global.lum" => grading.global.lum, "Global Luminance", Grading, -100, 100, 0, 1, 0, Centered;
     "grading.blending" => grading.blending, "Blending", Grading, 0, 100, 50, 1, 0, Plain;
     "grading.balance" => grading.balance, "Balance", Grading, -100, 100, 0, 1, 0, Centered;
+    "toning.sepia" => toning.sepia, "Sepia", Grading, 0, 100, 0, 1, 0, Gradient { from: "#8a8a8a", to: "#a87848" };
+    "toning.selenium" => toning.selenium, "Selenium", Grading, 0, 100, 0, 1, 0, Gradient { from: "#8a8a8a", to: "#6a4660" };
+    "toning.strength" => toning.strength, "Toning Strength", Grading, 0, 100, 50, 1, 0, Plain;
     "effects.texture" => effects.texture, "Texture", Effects, -100, 100, 0, 1, 0, Centered;
     "effects.clarity" => effects.clarity, "Clarity", Effects, -100, 100, 0, 1, 0, Centered;
     "effects.dehaze" => effects.dehaze, "Dehaze", Effects, -100, 100, 0, 1, 0, Centered;

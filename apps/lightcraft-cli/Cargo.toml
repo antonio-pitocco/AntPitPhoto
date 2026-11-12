@@ -26,8 +26,11 @@ serde_json = { workspace = true }
 dhat = { workspace = true, optional = true }
 
 [features]
-default = ["denoise"]
+default = ["denoise", "sam"]
 denoise = ["lightcraft-engine/denoise"]
+# AI masks (Object, Describe and the one-click Person / Skin / Hair / Clothing) with SAM 3: the
+# model itself is downloaded separately (docs/ai-masks.md).
+sam = ["lightcraft-engine/sam"]
 rawnind-model = ["denoise", "lightcraft-engine/rawnind-model"]
 # Heap profiling: `cargo run --release -p lightcraft-cli --features dhat-heap -- snapshot …` counts
 # every allocation (live/peak bytes in `library.memory` / `ui.inspect`) and writes dhat-heap.json

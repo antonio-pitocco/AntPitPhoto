@@ -56,6 +56,93 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
     Some(std::array::from_fn(|i| if chans[i] { MonotoneCurve::new(&to_pts(per[i])).to_lut(N).compose(&base) } else { base.clone() }))
 }
 
+/// A mask's own curve (master then per channel, on encoded values), or `None` when it changes
+/// nothing.
+pub fn mask_curve_luts(c: &lightcraft_develop::MaskCurve) -> Option<[Lut1; 3]> {
+    if c.is_identity() {
+        return None;
+    }
+    const N: usize = 1024;
+    let to_pts = |p: &[Point]| p.iter().take(lightcraft_develop::MaskCurve::MAX_POINTS).map(|q| (q.x, q.y)).collect::<Vec<_>>();
+    let base = if ToneCurve::point_curve_is_identity(&c.master) { Lut1::from_fn(N, |x| x) } else { MonotoneCurve::new(&to_pts(&c.master)).to_lut(N) };
+    let per = [&c.red, &c.green, &c.blue];
+    Some(std::array::from_fn(|i| {
+        if ToneCurve::point_curve_is_identity(per[i]) { base.clone() } else { MonotoneCurve::new(&to_pts(per[i])).to_lut(N).compose(&base) }
+    }))
+}
+
+/// Print toning ([`lightcraft_develop::Toning`]) as the per-pixel stage applies it: on the print's
+/// lightness (Oklab L of the output colour), last.
+#[derive(Clone, Copy, Debug)]
+pub struct Toning {
+    /// How far each toner reaches (0..1): sepia down from the lights, selenium up from the shadows.
+    sepia: f32,
+    selenium: f32,
+    /// Colour scale (1 = a normal bath).
+    k: f32,
+}
+
+/// Toner colours in Oklab: hue (radians) and the chroma at full tone.
+const SEPIA_HUE: f32 = 1.13; // ~65°: warm yellow-brown
+const SEPIA_CHROMA: f32 = 0.055;
+const SELENIUM_HUE: f32 = -0.30; // ~343°: purple-brown
+const SELENIUM_CHROMA: f32 = 0.034;
+
+impl Toning {
+    pub fn new(t: &lightcraft_develop::Toning) -> Toning {
+        Toning {
+            sepia: (t.sepia / 100.0).clamp(0.0, 1.0) as f32,
+            selenium: (t.selenium / 100.0).clamp(0.0, 1.0) as f32,
+            k: (t.strength / 50.0).clamp(0.0, 2.0) as f32,
+        }
+    }
+
+    /// Tone an Oklab colour (L in 0..1).
+    pub fn apply(&self, lab: [f32; 3]) -> [f32; 3] {
+        let l = lab[0].clamp(0.0, 1.0);
+        // how much silver there is to tone: none on paper white, most in the mid and dark tones
+        let silver = (1.0 - l).powf(0.8) * l.powf(0.35) * 1.9;
+        let mut out = lab;
+        if self.sepia > 0.0 {
+            // the bleach reaches the lights first, then lower as the amount grows
+            let edge = 1.0 - 1.05 * self.sepia;
+            let t = smooth(edge, edge + 0.28, l) * self.sepia.min(0.25) * 4.0;
+            let c = SEPIA_CHROMA * self.k * t * silver;
+            out[1] += c * SEPIA_HUE.cos();
+            out[2] += c * SEPIA_HUE.sin();
+            // silver sulphide is a little less dense than silver: the deepest tones open slightly
+            out[0] += 0.035 * self.k * t * (1.0 - l) * (1.0 - l);
+        }
+        if self.selenium > 0.0 {
+            // the densest silver tones first, then higher as the amount grows; even a full bath
+            // leaves the light tones nearly neutral (little silver there to convert)
+            let edge = 0.3 + 0.5 * self.selenium;
+            let t = (1.0 - smooth(edge - 0.28, edge, l)) * self.selenium.min(0.25) * 4.0;
+            let c = SELENIUM_CHROMA * self.k * t * silver * (1.0 - l) * 1.6;
+            out[1] += c * SELENIUM_HUE.cos();
+            out[2] += c * SELENIUM_HUE.sin();
+            // and the blacks deepen (higher Dmax)
+            out[0] -= 0.07 * self.k * t * (1.0 - l) * (1.0 - l) * (1.0 - l);
+        }
+        out
+    }
+}
+
+/// The inverse of a 3 × 3 matrix (`None` when singular).
+fn invert3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let [[a, b, c], [d, e, f], [g, h, i]] = m.map(|r| r.map(f64::from));
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if det.abs() < 1e-12 || !det.is_finite() {
+        return None;
+    }
+    let inv = [
+        [(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+        [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+        [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det],
+    ];
+    Some(inv.map(|r| r.map(|v| v as f32)))
+}
+
 /// Vignette (post-crop) parameters.
 #[derive(Clone, Copy, Debug)]
 pub struct Vig {
@@ -161,6 +248,10 @@ pub struct FinishParams {
     pub curves: Option<[Lut1; 3]>,
     /// Refine Saturation as 0..1 (1 = the curves' own saturation).
     pub refine_sat: f32,
+    /// The masks' own curves, by mask id (CPU only: the GPU path declines renders with them).
+    pub mask_curves: Vec<(u32, [Lut1; 3])>,
+    /// Print toning (CPU only: the GPU path declines renders with it).
+    pub toning: Option<Toning>,
     pub vig: Option<Vig>,
     /// Linear Rec.2020 → linear output RGB, the output's luminance weights (gamut mapping) and its
     /// encoding curve (see [`crate::output`]).
@@ -233,6 +324,8 @@ impl FinishParams {
             ops: ColorOps::new(s),
             curves: curve_luts(&s.curve),
             refine_sat: (s.curve.refine_saturation / 100.0).clamp(0.0, 1.0) as f32,
+            mask_curves: s.masks.iter().filter(|m| m.visible).filter_map(|m| Some((m.id, mask_curve_luts(&m.curve)?))).collect(),
+            toning: (s.section_enabled("color") && !s.toning.is_off()).then(|| Toning::new(&s.toning)),
             vig: if effects { vignette(s) } else { None },
             to_out: space.from_working(),
             out_luma: space.luma(),
@@ -389,7 +482,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
     let (hl, sh, clar, tex, dehaze, sharpen, sharpen_mask, air, air_pre, gain, ev) =
         (*hl, *sh, *clar, *tex, *dehaze, *sharpen, *sharpen_mask, *air, *air_pre, *gain, *ev);
     let terms: Vec<[f32; MASK_TERMS]> = p.masks.iter().map(|m| mask_terms(&m.adjust)).collect();
+    // the masks' curves, in the order of `p.masks` (only the ones that have a curve)
+    let mask_curves: Vec<(usize, &[Lut1; 3])> =
+        p.masks.iter().enumerate().filter_map(|(k, m)| fp.mask_curves.iter().find(|(id, _)| *id == m.id).map(|(_, l)| (k, l))).collect();
     let out_to_norm = fp.out_to_norm;
+    let from_out = fp.toning.as_ref().and_then(|_| invert3(to_out));
     let long = fp.ow.max(fp.oh);
     let [vx, vy, vw, vh] = fp.view;
     // the vignette belongs to the whole output frame, not to the window being drawn
@@ -637,6 +734,17 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
             }
+            // --- the masks' own curves, blended in by their coverage (above SDR white, an HDR
+            // value keeps what the curve does at white)
+            for (k, l) in &mask_curves {
+                let a = p.masks[*k].alpha.data[i];
+                if a > 0.0 {
+                    e = std::array::from_fn(|c| {
+                        let x = e[c].clamp(0.0, 1.0);
+                        e[c] + a * (l[c].eval(x) - x)
+                    });
+                }
+            }
             if let Some((amt, cell, rough, seed)) = *grain {
                 let n = out_to_norm.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
                 let (gx, gy) = ((n.x * fp.ow) as f32 / long as f32, (n.y * fp.oh) as f32 / long as f32);
@@ -649,6 +757,17 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 }
                 let k = amt * g * (0.35 + 2.6 * lum * (1.0 - lum));
                 e = e.map(|v| v + k);
+            }
+            // --- print toning, last: on the lightness of the output colour (in the working space,
+            // so the toner's colour doesn't depend on the output primaries)
+            if let (Some(tn), Some(from_out)) = (&fp.toning, &from_out) {
+                let c = e.map(|v| v.clamp(0.0, 1.0));
+                let w = mul3(from_out, c.map(lightcraft_color::transfer::srgb_to_linear));
+                let lab = tn.apply(lightcraft_color::perceptual::oklab_from_2020(w));
+                let lin = mul3(to_out, lightcraft_color::perceptual::oklab_to_2020(lab));
+                let (lin, _) = gamut_map(lin, *out_luma);
+                // values beyond 0..1 (HDR) keep their excess
+                e = std::array::from_fn(|k| e[k] + linear_to_srgb(lin[k].clamp(0.0, 1.0)) - c[k]);
             }
             let e = match &p_lut {
                 Some((l, k)) if hdr => {
@@ -786,6 +905,51 @@ mod tests {
         // luma is kept
         let y = |e: [f32; 3]| 0.2126 * e[0] + 0.7152 * e[1] + 0.0722 * e[2];
         assert!((y(r) - y(after)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn toners_act_where_the_darkroom_ones_do() {
+        let tone = |sepia: f64, selenium: f64| Toning::new(&lightcraft_develop::Toning { sepia, selenium, strength: 50.0 });
+        let chroma = |lab: [f32; 3]| lab[1].hypot(lab[2]);
+        let (dark, mid, light, paper) = ([0.25, 0.0, 0.0], [0.5, 0.0, 0.0], [0.85, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        // a light sepia bath tones the lights, not the shadows; paper white stays white
+        let s = tone(25.0, 0.0);
+        assert!(chroma(s.apply(light)) > 0.005, "{:?}", s.apply(light));
+        assert!(chroma(s.apply(dark)) < 0.002, "{:?}", s.apply(dark));
+        assert!(chroma(s.apply(paper)) < 1e-4);
+        // a full one reaches the shadows too, warm (Oklab b > 0, a > 0)
+        let full = tone(100.0, 0.0).apply(dark);
+        assert!(full[1] > 0.0 && full[2] > 0.0 && chroma(full) > 0.01, "{full:?}");
+        // selenium: the shadows first, purple-brown (a > 0, b < 0), the blacks deeper; lights almost untouched
+        let se = tone(0.0, 60.0);
+        let d = se.apply(dark);
+        assert!(d[1] > 0.0 && d[2] < 0.0 && d[0] < dark[0], "{d:?}");
+        assert!(chroma(se.apply(light)) < 0.003, "{:?}", se.apply(light));
+        assert!(chroma(se.apply(dark)) > chroma(se.apply(mid)));
+        // both: warm lights, cool shadows (split toning)
+        let both = tone(60.0, 60.0);
+        assert!(both.apply(light)[2] > 0.0 && both.apply(dark)[2] < both.apply(light)[2]);
+        // off is off
+        assert_eq!(tone(0.0, 0.0).apply(mid), mid);
+    }
+
+    #[test]
+    fn mask_curves_are_tables_or_nothing() {
+        use lightcraft_develop::MaskCurve;
+        use lightcraft_geom::Point;
+        assert!(mask_curve_luts(&MaskCurve::default()).is_none());
+        let c = MaskCurve {
+            master: vec![Point::new(0.0, 0.0), Point::new(0.25, 0.1), Point::new(0.75, 0.9), Point::new(1.0, 1.0)],
+            ..Default::default()
+        };
+        let [r, g, b] = mask_curve_luts(&c).unwrap();
+        // a steeper S: shadows down, lights up, the same on every channel
+        assert!(r.eval(0.25) < 0.15 && r.eval(0.75) > 0.85);
+        assert_eq!((r.eval(0.3), g.eval(0.3)), (g.eval(0.3), b.eval(0.3)));
+        // a red-only curve leaves green and blue alone
+        let red = MaskCurve { red: vec![Point::new(0.0, 0.0), Point::new(0.5, 0.7), Point::new(1.0, 1.0)], ..Default::default() };
+        let [r, g, _] = mask_curve_luts(&red).unwrap();
+        assert!(r.eval(0.5) > 0.6 && (g.eval(0.5) - 0.5).abs() < 1e-3);
     }
 
     #[test]

@@ -459,6 +459,10 @@ pub fn try_render(
             || req.depth != lightcraft_pipeline::OutputDepth::U8
             || req.proof.is_some()
             || req.overlay == lightcraft_pipeline::Overlay::HdrRange
+            // a curve inside a mask has no GPU stage (yet): CPU
+            || s.masks.iter().any(|m| m.visible && !m.curve.is_identity())
+            // print toning neither
+            || !s.toning.is_off()
         {
             return Err(Fallback::NotTried);
         }

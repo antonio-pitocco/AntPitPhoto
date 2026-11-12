@@ -113,6 +113,61 @@ fn develop_set_and_interaction_coalesces() {
 }
 
 #[test]
+fn a_call_naming_another_photo_changes_nothing() {
+    // an agent's library.select failed, so photo 1 is still active: edits meant for photo 2 must
+    // not land on photo 1
+    let mut s = demo();
+    let vis = s.visible_cloned();
+    let (one, two) = (vis[0], vis[1]);
+    s.execute("library.select", &json!({"ids": [one.0], "active": one.0})).unwrap();
+    let before = active_dev(&s);
+    for (cmd, p) in [
+        ("develop.set", json!({"photo": two.0, "values": {"light.exposure": 1.0}})),
+        ("mask.add", json!({"photo": two.0, "kind": "radial", "center": [0.5, 0.5], "rx": 0.2, "ry": 0.2})),
+        ("crop.set", json!({"photo": two.0, "rect": [0.1, 0.1, 0.9, 0.9]})),
+        ("spot.add", json!({"photo": two.0, "mode": "fill", "points": [[0.5, 0.5]]})),
+    ] {
+        let e = s.execute(cmd, &p).unwrap_err().to_string();
+        assert!(e.contains(&format!("photo {} is not the active photo", two.0)), "{cmd}: {e}");
+    }
+    assert_eq!(active_dev(&s), before, "nothing changed");
+    assert!(s.execute("develop.set", &json!({"photo": "two", "values": {}})).is_err(), "a non-number is refused");
+    // naming the active photo runs the command, and `photo` doesn't reach it
+    s.execute("develop.set", &json!({"photo": one.0, "values": {"light.exposure": 0.7}})).unwrap();
+    assert_eq!(active_dev(&s).light.exposure, 0.7);
+    s.execute("mask.add", &json!({"photo": one.0, "kind": "radial", "center": [0.5, 0.5], "rx": 0.2, "ry": 0.2})).unwrap();
+    s.execute("mask.adjust", &json!({"photo": one.0, "values": {"exposure": -0.5}})).unwrap();
+    assert_eq!(active_dev(&s).masks.last().unwrap().adjust.exposure, -0.5);
+}
+
+#[test]
+fn mask_geometry_is_taken_as_given_or_refused() {
+    use lightcraft_develop::MaskShape;
+    let mut s = demo();
+    let last = |s: &Session| active_dev(s).masks.last().map(|m| m.components[0].shape.clone());
+    // no geometry: a visible default
+    s.execute("mask.add", &json!({"kind": "linear"})).unwrap();
+    assert!(matches!(last(&s), Some(MaskShape::Linear { .. })));
+    // {x, y} points are read, not dropped for the default
+    s.execute("mask.add", &json!({"kind": "linear", "start": {"x": 0.5, "y": 0.33}, "end": {"x": 0.5, "y": 0.72}})).unwrap();
+    let Some(MaskShape::Linear { start, end }) = last(&s) else { panic!() };
+    assert_eq!((start.y, end.y), (0.33, 0.72));
+    let n = active_dev(&s).masks.len();
+    for bad in [
+        json!({"kind": "linear", "start": [0.5], "end": [0.5, 0.7]}),
+        json!({"kind": "linear", "start": [0.5, 0.5], "end": [0.5, 0.5]}),
+        json!({"kind": "linear", "from": [0.5, 0.2], "to": [0.5, 0.8]}),
+        json!({"kind": "radial", "centre": [0.4, 0.4]}),
+        json!({"kind": "radial", "rx": "big"}),
+        json!({"kind": "radial", "rx": 0}),
+        json!({"kind": "luminanceRange", "lo": "dark"}),
+    ] {
+        assert!(s.execute("mask.add", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(active_dev(&s).masks.len(), n, "a refused mask isn't added");
+}
+
+#[test]
 fn copy_paste_sync_presets() {
     let mut s = demo();
     let vis = s.visible_cloned();
