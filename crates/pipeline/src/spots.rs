@@ -242,11 +242,17 @@ pub fn window_for_reads_checked(
 /// Content-aware fill of the box: `src` becomes `tgt` with every pixel under the stroke (`alpha > 0`)
 /// rebuilt from the rest of the box. Falls back to a smooth membrane fill when the box holds no whole
 /// patch to copy from.
+/// Content-aware fill decides the hole's structure (exemplar-based, in isophote order) at the
+/// pyramid level where the hole is at most this many pixels across; finer levels add detail.
+const FILL_STRUCTURE_EXTENT: usize = 256;
+
 fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize) {
     let hole: Vec<bool> = alpha.iter().map(|a| *a > 0.0).collect();
     let flat: Vec<f32> = tgt.iter().flatten().copied().collect();
-    let out = lightcraft_inpaint::complete(bw, bh, 3, &flat, &hole, &lightcraft_inpaint::CompleteParams::default())
-        .unwrap_or_else(|| lightcraft_inpaint::membrane_fill(bw, bh, 3, &flat, &hole));
+    // seeded in structure order, so a pole or cable crossing the spot is continued, not cut
+    let params = lightcraft_inpaint::CompleteParams { structure_extent: FILL_STRUCTURE_EXTENT, ..Default::default() };
+    let out =
+        lightcraft_inpaint::complete(bw, bh, 3, &flat, &hole, &params).unwrap_or_else(|| lightcraft_inpaint::membrane_fill(bw, bh, 3, &flat, &hole));
     let (pixels, _) = out.as_chunks::<3>();
     for (d, v) in src.iter_mut().zip(pixels) {
         *d = *v;

@@ -65,12 +65,16 @@ pub struct CompleteParams {
     /// match field (one local PatchMatch pass and one vote), which keeps big holes tractable: the
     /// structure is decided at coarse scale, fine levels just add detail.
     pub refine_extent: usize,
+    /// When non-zero, the pyramid stops once the hole is at most this many pixels across, and that
+    /// coarsest level is seeded by exemplar-based inpainting ([`crate::exemplar::exemplar_fill`],
+    /// which continues edges, poles and cables into the hole) instead of the smooth membrane.
+    pub structure_extent: usize,
     pub seed: u64,
 }
 
 impl Default for CompleteParams {
     fn default() -> Self {
-        Self { patch_radius: 3, em_iters: 8, min_em_iters: 2, pm_iters: 2, refine_extent: 96, seed: 1 }
+        Self { patch_radius: 3, em_iters: 8, min_em_iters: 2, pm_iters: 2, refine_extent: 96, structure_extent: 0, seed: 1 }
     }
 }
 
@@ -390,7 +394,7 @@ pub fn complete_with(
     let mut exts = vec![ext];
     while let Some(l) = levels.last() {
         check()?;
-        if ext <= 2 * psz || l.w / 2 < 3 * psz || l.h / 2 < 3 * psz {
+        if ext <= 2 * psz.max(p.structure_extent.div_ceil(2)) || l.w / 2 < 3 * psz || l.h / 2 < 3 * psz {
             break;
         }
         let d = downsample(l, ch);
@@ -406,6 +410,12 @@ pub fn complete_with(
         let Level { w: lw, h: lh, img: mut limg, hole: lhole } = levels[li].clone();
         // Initialise the hole: membrane at the coarsest level, upsampled result elsewhere.
         match &prev {
+            None if p.structure_extent > 0 => {
+                limg = match crate::exemplar::exemplar_fill(lw, lh, ch, &limg, &lhole, r, cancelled)? {
+                    Some(f) => f,
+                    None => membrane_fill(lw, lh, ch, &limg, &lhole),
+                }
+            }
             None => limg = membrane_fill(lw, lh, ch, &limg, &lhole),
             Some((pw, ph, pimg)) => {
                 for y in 0..lh {

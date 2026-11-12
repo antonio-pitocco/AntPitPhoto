@@ -2,6 +2,8 @@
 //!
 //! * [`complete`]: multi-scale patch-based completion (Wexler, Shechtman, Irani 2007) with the
 //!   nearest-neighbour field found by PatchMatch (Barnes et al. 2009). See [`patchmatch`].
+//! * [`exemplar_fill`]: exemplar-based inpainting in structure order (Criminisi, Pérez, Toyama
+//!   2004), which seeds [`complete`] so lines crossing the hole are continued. See [`exemplar`].
 //! * [`membrane_fill`]: smooth harmonic fill, used to seed the coarsest level and as a fallback.
 //!
 //! Buffers are interleaved `w × h × ch` floats in any colour model plus a `w × h` hole mask.
@@ -18,9 +20,11 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod exemplar;
 pub mod membrane;
 pub mod patchmatch;
 
+pub use exemplar::exemplar_fill;
 pub use membrane::membrane_fill;
 pub use patchmatch::{CompleteParams, complete, complete_with};
 
